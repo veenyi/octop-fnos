@@ -1,0 +1,54 @@
+name: Sync upstream main
+
+# 双轨贡献模式 —— 官方同步基线
+# 保持本仓库 main 与官方 TencentCloud/Octop main 一致（每 6 小时 + 手动触发）。
+# 新贡献请从同步后的 main 切独立分支提交 PR，保证 PR 永远基于官方最新代码。
+#
+# 注意：官方 main 自带的 workflow（ci.yml 等）在本 fork 的 push 事件中也会触发，
+# 它们缺少官方 secrets 会失败——无害。建议在 Actions 设置里禁用官方 CI 工作流，
+# 只保留本 sync 与需要的工作流，避免失败通知刷屏。
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync from TencentCloud/Octop
+        run: |
+          git remote add upstream https://github.com/TencentCloud/Octop.git \
+            || git remote set-url upstream https://github.com/TencentCloud/Octop.git
+
+          BEFORE=$(git rev-parse HEAD)
+          git fetch upstream main
+
+          # 优先 fast-forward（main 纯净时）；本地仅含基础设施文件（本 workflow 等
+          # 官方没有的文件）时用 3-way 合并，避免冲突。
+          if ! git merge --ff-only upstream/main 2>/dev/null; then
+            git merge --no-edit upstream/main
+          fi
+
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" != "$AFTER" ]; then
+            git push origin main
+            echo "✅ 已同步官方 main 更新并推送到本仓库 main。"
+          else
+            echo "✅ main 已是最新，无需同步。"
+          fi
