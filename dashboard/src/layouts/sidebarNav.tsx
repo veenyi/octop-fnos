@@ -14,7 +14,7 @@ import {
   Sparkles,
   Puzzle,
   Package,
-  FolderOpen,
+  HardDrive,
   GraduationCap,
   Shield,
   PanelsTopLeft,
@@ -144,7 +144,6 @@ export function buildNavSections(
       path: "/knowledge-bases",
       icon: <Database size={iconSize} strokeWidth={iconStroke} />,
       labelKey: "nav.knowledgeBases",
-      badge: "BETA",
     });
   }
   if (settingsItems.length > 0) {
@@ -206,7 +205,7 @@ export function buildNavSections(
     adminItems.push({
       key: "admin-storage",
       path: "/admin/backend",
-      icon: <FolderOpen size={iconSize} strokeWidth={iconStroke} />,
+      icon: <HardDrive size={iconSize} strokeWidth={iconStroke} />,
       labelKey: "nav.adminStorage",
     });
   }

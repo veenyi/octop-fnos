@@ -4,18 +4,26 @@ import { message } from "@/utils/antdMessage";
 
 import {
   Activity,
+  Blocks,
   CheckCircle2,
   ClipboardPaste,
   Copy,
   Download,
   ExternalLink,
+  Link2,
+  Plug,
+  Plus,
   RefreshCw,
   Sparkles,
+  Wrench,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useSearchParams } from "react-router-dom";
 
 import PageShell from "../../../layouts/PageShell";
+import TabBar, { type TabBarItem } from "../../../components/TabLabel/TabBar";
+import StreamSetupGuide from "../../../components/StreamSetupGuide/StreamSetupGuide";
+import { OctopEmptyMascot } from "../../../components/EmptyState/OctopEmptyMascot";
 import { useCurrentUser } from "../../../hooks/useCurrentUser";
 import { userCan } from "../../../utils/permissions";
 import { apiErrorMessage } from "../../../utils/apiError";
@@ -36,6 +44,7 @@ import {
   type FeishuUserAuthStartResult,
 } from "../../../api/modules/connectors";
 import { ConnectorCard } from "./ConnectorCard";
+import { ConnectorInstanceCard } from "./ConnectorInstanceCard";
 import { CustomMcpTab } from "./CustomMcpTab";
 import {
   INLINE_CREDENTIAL_GUIDE_KINDS,
@@ -44,6 +53,11 @@ import {
   mailProviderById,
 } from "./connectorDefs";
 import { notifyConnectorsChanged } from "./customMcpUtils";
+import {
+  extractHttpUrl,
+  isDifyMcpServerUrl,
+  isGuidedConnector,
+} from "./guidedConnectorUtils";
 import { useConnectorInstances } from "./useConnectors";
 import styles from "./index.module.less";
 
@@ -109,6 +123,18 @@ function buildCredentials(
     credentials.sdk_id = values.sdk_id;
     const secret_key = String(values.secret_key ?? "").trim();
     if (secret_key) credentials.secret_key = secret_key;
+  } else if (entry.auth_kind === "custom_fields") {
+    for (const field of entry.credential_fields ?? []) {
+      const text = String(values[field.key] ?? "").trim();
+      if (!text) continue;
+      credentials[field.key] =
+        field.field_type === "tags"
+          ? text
+              .split(",")
+              .map((item) => item.trim())
+              .filter(Boolean)
+          : text;
+    }
   }
   return credentials;
 }
@@ -120,15 +146,19 @@ function previewToFormValues(
   if (!detail) {
     return {
       display_name: entry.name,
+      description: entry.description,
       mail_provider: "qq",
       default_open: false,
+      shared: false,
     };
   }
   const preview = detail.credentials_preview ?? {};
   const values: Record<string, unknown> = {
     display_name: detail.display_name || entry.name,
+    description: detail.description || entry.description,
     default_open:
       detail.default_open === true || detail.config?.default_open === true,
+    shared: detail.shared === true,
   };
   if (preview.email) values.email = preview.email;
   if (preview.mail_provider) values.mail_provider = preview.mail_provider;
@@ -145,6 +175,17 @@ function previewToFormValues(
   if (preview.sdk_id) values.sdk_id = preview.sdk_id;
   if (entry.auth_kind === "oauth2" && preview.oauth_configured) {
     values.access_token = "__configured__";
+  }
+  if (entry.auth_kind === "custom_fields") {
+    for (const field of entry.credential_fields ?? []) {
+      if (field.secret) continue;
+      const value = preview[field.key];
+      if (Array.isArray(value)) {
+        values[field.key] = value.join(", ");
+      } else if (value !== undefined && value !== null) {
+        values[field.key] = value;
+      }
+    }
   }
   return values;
 }
@@ -178,7 +219,30 @@ function hasFreshCredentialInput(
   if (entry.auth_kind === "api_credentials") {
     return Boolean(String(values.secret_key ?? "").trim());
   }
+  if (entry.auth_kind === "custom_fields") {
+    return (entry.credential_fields ?? []).some(
+      (field) =>
+        field.secret && Boolean(String(values[field.key] ?? "").trim()),
+    );
+  }
   return false;
+}
+
+function customCredentialConfigChanged(
+  entry: ConnectorCatalogEntry,
+  values: Record<string, unknown>,
+  preview: ConnectorCredentialsPreview,
+): boolean {
+  if (entry.auth_kind !== "custom_fields") return false;
+  return (entry.credential_fields ?? []).some((field) => {
+    if (field.secret) return false;
+    const current = String(values[field.key] ?? "").trim();
+    const storedValue = preview[field.key];
+    const stored = Array.isArray(storedValue)
+      ? storedValue.join(", ")
+      : String(storedValue ?? "").trim();
+    return current !== stored;
+  });
 }
 
 function openAuthorizeLabel(
@@ -216,7 +280,7 @@ function secretFieldRules(required: boolean) {
 
 function configuredExtra(
   preview: ConnectorCredentialsPreview | undefined,
-  key: keyof ConnectorCredentialsPreview,
+  key: string,
   t: (key: string, fallback: string) => string,
 ) {
   if (!preview?.[key]) return undefined;
@@ -260,6 +324,7 @@ function ConnectorConfigDrawer({
     null,
   );
   const [installingCli, setInstallingCli] = useState(false);
+  const [detectingLocalWeKnora, setDetectingLocalWeKnora] = useState(false);
   const [feishuUserAuth, setFeishuUserAuth] =
     useState<FeishuUserAuthStartResult | null>(null);
   const [feishuUserAuthBusy, setFeishuUserAuthBusy] = useState(false);
@@ -301,7 +366,12 @@ function ConnectorConfigDrawer({
     setFeishuAuthNeedsReauth(false);
     setFeishuRefreshExpiresAt(null);
     form.resetFields();
-    form.setFieldsValue({ display_name: entry.name, default_open: false });
+    form.setFieldsValue({
+      display_name: entry.name,
+      description: entry.description,
+      default_open: false,
+      shared: false,
+    });
 
     void connectorsApi
       .authInfo(entry.kind)
@@ -351,6 +421,7 @@ function ConnectorConfigDrawer({
         .catch(() => {
           form.setFieldsValue({
             display_name: instance.display_name || entry.name,
+            description: instance.description || entry.description,
             default_open: instance.default_open === true,
           });
           applyConnectorDraft();
@@ -685,6 +756,86 @@ function ConnectorConfigDrawer({
     }
   };
 
+  const handleGuidedPaste = async () => {
+    if (!entry || !isGuidedConnector(entry.kind)) return;
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (!text) {
+        message.warning(t("connectors.clipboardEmpty", "剪贴板为空"));
+        return;
+      }
+      const pastedUrl = extractHttpUrl(text);
+      if (entry.kind === "dify") {
+        if (!pastedUrl) {
+          message.warning(
+            t("connectors.difyPasteUrlRequired", "剪贴板中没有 MCP URL"),
+          );
+          return;
+        }
+        form.setFieldValue("mcp_url", pastedUrl);
+        await form.validateFields(["mcp_url"]);
+      } else if (pastedUrl) {
+        form.setFieldValue("base_url", pastedUrl);
+      } else {
+        form.setFieldValue("api_key", text);
+      }
+      saveFormDraft(
+        draftScope,
+        form.getFieldsValue() as Record<string, unknown>,
+      );
+      message.success(t("connectors.pasteSuccess", "已粘贴"));
+    } catch (error) {
+      if (error && typeof error === "object" && "errorFields" in error) {
+        message.warning(
+          t(
+            "connectors.difyMcpUrlInvalid",
+            "请粘贴 Dify 访问点提供的完整 MCP Server URL",
+          ),
+        );
+        return;
+      }
+      message.error(
+        t("connectors.clipboardDenied", "无法读取剪贴板，请手动粘贴"),
+      );
+    }
+  };
+
+  const handleDetectLocalWeKnora = async () => {
+    if (detectingLocalWeKnora) return;
+    setDetectingLocalWeKnora(true);
+    try {
+      const result = await connectorsApi.detectLocalWeKnora();
+      if (!result.found || !result.base_url) {
+        message.warning(
+          t(
+            "connectors.weknoraNotFound",
+            "未在 OCTOP 主机的 127.0.0.1:8080 检测到 WeKnora",
+          ),
+        );
+        return;
+      }
+      form.setFieldValue("base_url", result.base_url);
+      saveFormDraft(
+        draftScope,
+        form.getFieldsValue() as Record<string, unknown>,
+      );
+      message.success(
+        t("connectors.weknoraFound", "已检测到本机 WeKnora 并填入地址"),
+      );
+    } catch (error) {
+      console.error(error);
+      message.error(
+        apiErrorMessage(
+          error,
+          t("connectors.weknoraDetectFailed", "检测本机 WeKnora 失败"),
+          t,
+        ),
+      );
+    } finally {
+      setDetectingLocalWeKnora(false);
+    }
+  };
+
   const handleOAuth = async () => {
     if (!entry || authorizing) return;
     const popup = window.open("", "octop-oauth", "width=520,height=720");
@@ -737,12 +888,24 @@ function ConnectorConfigDrawer({
           return;
         }
 
-        await connectorsApi.createInstance({
-          kind: entry.kind,
-          display_name: String(values.display_name || entry.name),
-          credentials,
-          default_open: values.default_open === true,
-        });
+        if (instance) {
+          await connectorsApi.patchInstance(instance.instance_id, {
+            display_name: String(values.display_name || entry.name),
+            description: String(values.description || entry.description),
+            credentials,
+            default_open: values.default_open === true,
+            shared: values.shared === true,
+          });
+        } else {
+          await connectorsApi.createInstance({
+            kind: entry.kind,
+            display_name: String(values.display_name || entry.name),
+            description: String(values.description || entry.description),
+            credentials,
+            default_open: values.default_open === true,
+            shared: values.shared === true,
+          });
+        }
         clearFormDraft(draftScope);
         message.success(t("connectors.createSuccess", "连接器已创建"));
         onSaved();
@@ -751,6 +914,7 @@ function ConnectorConfigDrawer({
         console.error(e);
         form.setFieldsValue({
           display_name: entry.name,
+          description: entry.description,
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token,
           expires_at: tokens.expires_at,
@@ -785,7 +949,7 @@ function ConnectorConfigDrawer({
 
     try {
       const { authorize_url, state_id } = await connectorsApi.oauthStart(
-        entry.kind,
+        { type: "catalog", kind: entry.kind },
         "/connectors",
       );
       stateId = state_id;
@@ -843,17 +1007,35 @@ function ConnectorConfigDrawer({
       Boolean(preview.bot_id) &&
       String(values.bot_id ?? "").trim() !==
         String(preview.bot_id ?? "").trim();
-    const identityChanged = feishuAppIdChanged || wecomBotIdChanged;
-    if (identityChanged && !freshSecret) {
+    const customConfigChanged = customCredentialConfigChanged(
+      entry,
+      values,
+      preview,
+    );
+    const customHasStoredSecret = (entry.credential_fields ?? []).some(
+      (field) => field.secret && preview[`${field.key}_configured`] === true,
+    );
+    const identityChanged =
+      feishuAppIdChanged || wecomBotIdChanged || customConfigChanged;
+    if (
+      identityChanged &&
+      !freshSecret &&
+      (entry.auth_kind !== "custom_fields" || customHasStoredSecret)
+    ) {
       message.warning(
         entry.kind === "feishu-cli"
           ? t(
               "connectors.probeNeedSecretAfterAppIdChange",
               "App ID 已修改，请填写 App Secret 后再探测",
             )
-          : t(
+          : entry.kind === "wecom-cli"
+          ? t(
               "connectors.probeNeedSecretAfterBotIdChange",
               "Bot ID 已修改，请填写 Secret 后再探测",
+            )
+          : t(
+              "connectors.probeNeedSecretAfterConfigChange",
+              "连接配置已修改，请重新填写密钥后再探测",
             ),
       );
       return;
@@ -927,12 +1109,24 @@ function ConnectorConfigDrawer({
     setSaving(true);
     try {
       const payload = buildCredentials(entry, values);
-      await connectorsApi.createInstance({
-        kind: entry.kind,
-        display_name: values.display_name as string,
-        credentials: payload,
-        default_open: values.default_open === true,
-      });
+      if (instance) {
+        await connectorsApi.patchInstance(instance.instance_id, {
+          display_name: values.display_name as string,
+          description: values.description as string,
+          credentials: payload,
+          default_open: values.default_open === true,
+          shared: values.shared === true,
+        });
+      } else {
+        await connectorsApi.createInstance({
+          kind: entry.kind,
+          display_name: values.display_name as string,
+          description: values.description as string,
+          credentials: payload,
+          default_open: values.default_open === true,
+          shared: values.shared === true,
+        });
+      }
       message.success(
         hasStoredCredentials
           ? t("connectors.saveSuccess", "连接器已保存")
@@ -959,6 +1153,7 @@ function ConnectorConfigDrawer({
   const guideUrl = authInfo?.guide_url ?? entry.guide_url ?? entry.doc_url;
   const manualUrl = authInfo?.manual_url ?? entry.manual_url ?? guideUrl;
   const authHint = authInfo?.auth_hint ?? entry.auth_hint;
+  const guidedKind = isGuidedConnector(entry.kind) ? entry.kind : null;
 
   const preview = instanceDetail?.credentials_preview;
   const secretRequired = !hasStoredCredentials;
@@ -978,11 +1173,11 @@ function ConnectorConfigDrawer({
         hasStoredCredentials
           ? t("connectors.editConnection", {
               name: entry.name,
-              defaultValue: `配置 ${entry.name}`,
+              defaultValue: `编辑 ${entry.name} 连接器`,
             })
-          : t("connectors.configureConnection", {
+          : t("connectors.createConnection", {
               name: entry.name,
-              defaultValue: `配置 ${entry.name}`,
+              defaultValue: `创建 ${entry.name} 连接器`,
             })
       }
       open={open}
@@ -1018,6 +1213,45 @@ function ConnectorConfigDrawer({
 
         {authHint && <div className={styles.authHint}>{authHint}</div>}
 
+        {guidedKind && (
+          <div className={styles.guidedSetup}>
+            <div className={styles.guidedSetupTitle}>
+              {t("connectors.guidedSetup", "快速接入")}
+            </div>
+            {guidedKind === "weknora" ? (
+              <ol>
+                <li>
+                  {t("connectors.weknoraStep1", "打开 WeKnora 并创建 API Key")}
+                </li>
+                <li>
+                  {t(
+                    "connectors.weknoraStep2",
+                    "检测本机服务，或手动填写部署地址",
+                  )}
+                </li>
+                <li>
+                  {t("connectors.guidedStepProbe", "粘贴凭证后探测并保存")}
+                </li>
+              </ol>
+            ) : (
+              <ol>
+                <li>
+                  {t("connectors.difyStep1", "在 Dify 中发布应用或工作流")}
+                </li>
+                <li>
+                  {t(
+                    "connectors.difyStep2",
+                    "在访问点启用 MCP 并复制完整 Server URL",
+                  )}
+                </li>
+                <li>
+                  {t("connectors.guidedStepProbe", "粘贴凭证后探测并保存")}
+                </li>
+              </ol>
+            )}
+          </div>
+        )}
+
         {guideUrl && !hideGuideLink && (
           <div className={styles.guideLinks}>
             <a href={guideUrl} target="_blank" rel="noreferrer">
@@ -1027,6 +1261,27 @@ function ConnectorConfigDrawer({
         )}
 
         <div className={styles.quickAuthBar}>
+          {guidedKind && (
+            <>
+              {guidedKind === "weknora" && (
+                <Button
+                  icon={<RefreshCw size={14} />}
+                  loading={detectingLocalWeKnora}
+                  onClick={() => void handleDetectLocalWeKnora()}
+                >
+                  {t("connectors.detectLocal", "检测本机服务")}
+                </Button>
+              )}
+              <Button
+                icon={<ClipboardPaste size={14} />}
+                onClick={() => void handleGuidedPaste()}
+              >
+                {guidedKind === "dify"
+                  ? t("connectors.pasteMcpUrl", "粘贴 MCP 地址")
+                  : t("connectors.smartPaste", "智能粘贴")}
+              </Button>
+            </>
+          )}
           {entry && isHostCliConnector(entry.kind) && (
             <>
               {canInstallCli && (
@@ -1234,6 +1489,69 @@ function ConnectorConfigDrawer({
           >
             <Input placeholder={entry.name} />
           </Form.Item>
+          <Form.Item
+            name="description"
+            label={t("connectors.description", "描述")}
+            rules={[{ required: true }]}
+          >
+            <Input.TextArea
+              rows={3}
+              maxLength={500}
+              showCount
+              placeholder={entry.description}
+            />
+          </Form.Item>
+
+          {entry.auth_kind === "custom_fields" &&
+            (entry.credential_fields ?? []).map((field) => {
+              const isSecret = field.secret || field.field_type === "password";
+              const input = isSecret ? (
+                <Input.Password
+                  placeholder={
+                    hasStoredCredentials && field.secret
+                      ? t("connectors.secretPlaceholder", "留空表示不修改")
+                      : field.placeholder ?? undefined
+                  }
+                />
+              ) : (
+                <Input placeholder={field.placeholder ?? undefined} />
+              );
+              return (
+                <Form.Item
+                  key={field.key}
+                  name={field.key}
+                  label={field.label}
+                  rules={[
+                    ...(isSecret
+                      ? secretFieldRules(field.required && secretRequired)
+                      : [{ required: field.required }]),
+                    ...(entry.kind === "dify" && field.key === "mcp_url"
+                      ? [
+                          {
+                            validator: (_: unknown, value: unknown) =>
+                              !value || isDifyMcpServerUrl(String(value))
+                                ? Promise.resolve()
+                                : Promise.reject(
+                                    new Error(
+                                      t(
+                                        "connectors.difyMcpUrlInvalid",
+                                        "请粘贴 Dify 访问点提供的完整 MCP Server URL",
+                                      ),
+                                    ),
+                                  ),
+                          },
+                        ]
+                      : []),
+                  ]}
+                  extra={
+                    configuredExtra(preview, `${field.key}_configured`, t) ??
+                    field.help
+                  }
+                >
+                  {input}
+                </Form.Item>
+              );
+            })}
 
           {entry.auth_kind === "personal_token" && (
             <Form.Item
@@ -1696,8 +2014,20 @@ function ConnectorConfigDrawer({
           )}
 
           <Form.Item
+            name="shared"
+            label={t("connectors.shared", "是否共享")}
+            valuePropName="checked"
+            extra={t(
+              "connectors.sharedHint",
+              "共享后其他用户可以选择使用，但不能查看或修改配置。",
+            )}
+          >
+            <Switch />
+          </Form.Item>
+
+          <Form.Item
             name="default_open"
-            label={t("connectors.defaultOpen", "是否默认打开")}
+            label={t("connectors.defaultEnabled", "是否默认开启")}
             valuePropName="checked"
             extra={
               defaultOpen
@@ -1772,35 +2102,31 @@ function ConnectorConfigDrawer({
   );
 }
 
+type ConnectorTab = "enabled" | "builtin" | "custom";
+
+const CONNECTOR_TABS: TabBarItem<ConnectorTab>[] = [
+  { key: "enabled", labelKey: "connectors.tabEnabled", icon: Link2 },
+  { key: "builtin", labelKey: "connectors.tabBuiltin", icon: Blocks },
+  { key: "custom", labelKey: "connectors.tabCustom", icon: Wrench },
+];
+
 export default function ConnectorsPage() {
   const { t } = useTranslation();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [activeTab, setActiveTab] = useState<"builtin" | "custom">("builtin");
+  const [activeTab, setActiveTab] = useState<ConnectorTab>("enabled");
   const [drawerEntry, setDrawerEntry] = useState<ConnectorCatalogEntry | null>(
     null,
   );
   const [drawerInstance, setDrawerInstance] =
     useState<ConnectorInstance | null>(null);
+  const [customFocusServerName, setCustomFocusServerName] = useState<
+    string | null
+  >(null);
   const { catalog, instances, loading, refresh } = useConnectorInstances();
 
-  const instanceByKind = useMemo(() => {
-    const map = new Map<string, ConnectorInstance>();
-    for (const inst of instances) {
-      if (!map.has(inst.kind)) {
-        map.set(inst.kind, inst);
-      }
-    }
-    return map;
-  }, [instances]);
-
   const configuredCount = useMemo(() => {
-    let count = 0;
-    for (const entry of catalog) {
-      const inst = instanceByKind.get(entry.kind);
-      if (inst?.has_credentials) count += 1;
-    }
-    return count;
-  }, [catalog, instanceByKind]);
+    return instances.filter((instance) => instance.has_credentials).length;
+  }, [instances]);
 
   useEffect(() => {
     const oauthState = searchParams.get("oauth_state");
@@ -1830,6 +2156,7 @@ export default function ConnectorsPage() {
         await connectorsApi.createInstance({
           kind: entry.kind,
           display_name: entry.name,
+          description: entry.description,
           credentials,
           default_open: false,
         });
@@ -1852,26 +2179,6 @@ export default function ConnectorsPage() {
     [],
   );
 
-  const handleToggleEnabled = useCallback(
-    async (instance: ConnectorInstance, enabled: boolean) => {
-      try {
-        await connectorsApi.patchInstance(instance.instance_id, {
-          status: enabled ? "active" : "disabled",
-        });
-        await refresh();
-        message.success(
-          enabled
-            ? t("connectors.enableSuccess", "已启用")
-            : t("connectors.disableSuccess", "已停用"),
-        );
-      } catch (e) {
-        console.error(e);
-        message.error(t("connectors.toggleFailed", "更新失败"));
-      }
-    },
-    [refresh, t],
-  );
-
   const handleSaved = useCallback(async () => {
     await refresh();
     notifyConnectorsChanged();
@@ -1887,30 +2194,103 @@ export default function ConnectorsPage() {
       title={t("pageShell.connectors.title")}
       subtitle={t("pageShell.connectors.subtitle")}
       tabBar={
-        <div className={styles.tabBar}>
-          <button
-            type="button"
-            className={`${styles.tab}${
-              activeTab === "builtin" ? ` ${styles.active}` : ""
-            }`}
-            onClick={() => setActiveTab("builtin")}
-          >
-            {t("connectors.tabBuiltin", "内置连接器")}
-          </button>
-          <button
-            type="button"
-            className={`${styles.tab}${
-              activeTab === "custom" ? ` ${styles.active}` : ""
-            }`}
-            onClick={() => setActiveTab("custom")}
-          >
-            {t("connectors.tabCustom", "自定义连接器")}
-          </button>
-        </div>
+        <TabBar
+          tabs={CONNECTOR_TABS}
+          activeKey={activeTab}
+          onChange={(key) => {
+            if (key === "custom") setCustomFocusServerName(null);
+            setActiveTab(key);
+          }}
+        />
       }
     >
       {activeTab === "custom" ? (
-        <CustomMcpTab />
+        <CustomMcpTab focusServerName={customFocusServerName} />
+      ) : activeTab === "enabled" ? (
+        loading ? (
+          <div className={styles.loadingState}>
+            <Spin />
+          </div>
+        ) : instances.length === 0 ? (
+          <StreamSetupGuide
+            wide
+            icon={
+              <OctopEmptyMascot
+                size={120}
+                className={styles.emptyGuideMascot}
+              />
+            }
+            title={t("connectors.emptyGuideTitle")}
+            description={t("connectors.emptyGuideDesc")}
+            steps={[
+              {
+                label: t("connectors.emptyGuideStepWhat"),
+                detail: t("connectors.emptyGuideStepWhatDetail"),
+              },
+              {
+                label: t("connectors.emptyGuideStepHow"),
+                detail: t("connectors.emptyGuideStepHowDetail"),
+              },
+              {
+                label: t("connectors.emptyGuideStepShare"),
+                detail: t("connectors.emptyGuideStepShareDetail"),
+              },
+            ]}
+            primaryAction={{
+              label: t("connectors.emptyGuideBrowseBuiltin"),
+              onClick: () => setActiveTab("builtin"),
+              icon: <Plug size={14} />,
+            }}
+            secondaryAction={{
+              label: t("connectors.emptyGuideAddCustom"),
+              onClick: () => {
+                setCustomFocusServerName(null);
+                setActiveTab("custom");
+              },
+              icon: <Plus size={14} />,
+              type: "default",
+            }}
+          />
+        ) : (
+          <>
+            <div className={styles.listToolbar}>
+              <span className={styles.listToolbarMeta}>
+                {t("connectors.enabledSummary", {
+                  count: instances.length,
+                  defaultValue: "已启用 {{count}} 个连接器实例",
+                })}
+              </span>
+              <Button
+                icon={<RefreshCw size={14} />}
+                loading={loading}
+                onClick={() => void refresh()}
+              >
+                {t("common.refresh")}
+              </Button>
+            </div>
+            <div className={styles.typeGrid}>
+              {instances.map((instance) => (
+                <ConnectorInstanceCard
+                  key={instance.instance_id}
+                  instance={instance}
+                  catalogEntry={catalog.find(
+                    (entry) => entry.kind === instance.kind,
+                  )}
+                  onEdit={(item) => {
+                    if (item.kind === "custom-mcp") {
+                      setCustomFocusServerName(item.mcp_server_name);
+                      setActiveTab("custom");
+                      return;
+                    }
+                    const entry = catalog.find((row) => row.kind === item.kind);
+                    if (entry) handleConfigure(entry, item);
+                  }}
+                  onChanged={handleSaved}
+                />
+              ))}
+            </div>
+          </>
+        )
       ) : (
         <>
           <div className={styles.listToolbar}>
@@ -1940,11 +2320,7 @@ export default function ConnectorsPage() {
                 <ConnectorCard
                   key={entry.kind}
                   entry={entry}
-                  instance={instanceByKind.get(entry.kind) ?? null}
                   onConfigure={handleConfigure}
-                  onToggleEnabled={(inst, enabled) =>
-                    void handleToggleEnabled(inst, enabled)
-                  }
                 />
               ))}
             </div>

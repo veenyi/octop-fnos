@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from langchain_core.messages import HumanMessage
 
+from octop.infra.cron.delivery import CronDeliveryCommand, CronDeliveryService
 from octop.infra.gateway.process.message_keys import (
     COMPOSER_CTX_KEY,
     build_composer_context,
 )
+from octop.infra.gateway.threads import ThreadRegistry
 
 
 def test_cron_composer_context_includes_connectors_and_model() -> None:
@@ -27,22 +30,43 @@ def test_cron_composer_context_includes_connectors_and_model() -> None:
     }
 
 
-@pytest.mark.asyncio
-async def test_push_text_from_session_stamps_composer_on_human_message() -> None:
-    """Agent cron path must put COMPOSER_CTX_KEY on HumanMessage additional_kwargs."""
-    from octop.infra.gateway.gateway import Gateway
-
+def _dashboard_session() -> MagicMock:
     session = MagicMock()
-    session.channel_type = "dashboard"
+    session.channel_type = ThreadRegistry.CHANNEL_DASHBOARD
     session.thread_id = "thr1"
     session.user_id = 1
+    session.agent_id = "a1"
+    session.session_key = "a1:dashboard:1:dm"
     session.channel_id = None
-    session.to_channel_subject = MagicMock(return_value=MagicMock())
+    return session
 
+
+async def _run_locked(_agent_id: str, _session_key: str, operation) -> None:
+    await operation()
+
+
+def _command(**overrides: object) -> CronDeliveryCommand:
+    values: dict[str, object] = {
+        "cron_id": "j1",
+        "cron_name": "nightly",
+        "agent_id": "a1",
+        "user_id": 1,
+        "session_key": "a1:dashboard:1:dm",
+        "prompt": "cron prompt",
+        "fresh_thread": False,
+        "task_type": "agent",
+        "model": None,
+        "mcp_servers": (),
+    }
+    values.update(overrides)
+    return CronDeliveryCommand(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_deliver_agent_stamps_composer_on_human_message() -> None:
+    session = _dashboard_session()
     agent_row = MagicMock()
     agent_row.default_model = "openai/gpt-4o"
-
-    chunks = [{"type": "token", "content": "ok"}]
 
     async def _stream(_aid: str, request: dict):
         msgs = request.get("messages") or []
@@ -53,52 +77,39 @@ async def test_push_text_from_session_stamps_composer_on_human_message() -> None
             "connectors": ["github__1"],
             "model": "openai/gpt-4o-mini",
         }
-        for c in chunks:
-            yield c
+        yield {"type": "token", "content": "ok"}
 
     agent_manager = MagicMock()
     agent_manager.merge_turn_mcp_servers = MagicMock(
-        side_effect=lambda _uid, explicit, apply_defaults=None: list(explicit) if explicit else None
+        side_effect=lambda _uid, explicit, apply_defaults=None, extra_defaults=None: (
+            list(explicit) if explicit else None
+        )
     )
     agent_manager.prepare_chat_mcp = AsyncMock(return_value=[])
     agent_manager.stream = _stream
     agent_manager.get_row = MagicMock(return_value=agent_row)
 
-    gw = Gateway.__new__(Gateway)
-    gw._agent_manager = agent_manager
-    gw._thread_registry = MagicMock()
-    gw._thread_registry.get_session = MagicMock(return_value=session)
-    gw._require_session = MagicMock(return_value=session)
-    gw._bump_dashboard_session = MagicMock()
-    gw.push_text = AsyncMock()
-    gw._resolve_push_subject = MagicMock(return_value=MagicMock())
+    gateway = MagicMock()
+    gateway.run_in_session = _run_locked
+    gateway.require_session = MagicMock(return_value=session)
+    gateway.push_session_text = AsyncMock()
+    gateway.notify_dashboard_push = AsyncMock()
 
-    await Gateway.push_text_from_session(
-        gw,
-        "a1",
-        "a1:dashboard:1:dm",
-        "cron prompt",
-        task_type="agent",
-        model="openai/gpt-4o-mini",
-        mcp_servers=["github__1"],
+    service = CronDeliveryService(
+        gateway=gateway,
+        agent_manager=agent_manager,
+        repos=MagicMock(),
     )
+    await service.deliver(_command(model="openai/gpt-4o-mini", mcp_servers=("github__1",)))
 
     agent_manager.prepare_chat_mcp.assert_awaited()
-    gw.push_text.assert_awaited()
+    gateway.push_session_text.assert_awaited_once()
+    assert gateway.push_session_text.await_args.args[1] == "ok"
 
 
 @pytest.mark.asyncio
-async def test_push_text_from_session_merges_default_open_when_empty() -> None:
-    """Cron with no explicit mcp_servers still injects default_open connectors."""
-    from octop.infra.gateway.gateway import Gateway
-
-    session = MagicMock()
-    session.channel_type = "dashboard"
-    session.thread_id = "thr1"
-    session.user_id = 1
-    session.channel_id = None
-    session.to_channel_subject = MagicMock(return_value=MagicMock())
-
+async def test_deliver_agent_merges_default_open_when_empty() -> None:
+    session = _dashboard_session()
     agent_row = MagicMock()
     agent_row.default_model = "openai/gpt-4o"
 
@@ -113,45 +124,34 @@ async def test_push_text_from_session_merges_default_open_when_empty() -> None:
 
     agent_manager = MagicMock()
     agent_manager.merge_turn_mcp_servers = MagicMock(return_value=["always__1"])
+    agent_manager.default_mcp_servers = MagicMock(return_value=[])
     agent_manager.prepare_chat_mcp = AsyncMock(return_value=[])
     agent_manager.stream = _stream
     agent_manager.get_row = MagicMock(return_value=agent_row)
 
-    gw = Gateway.__new__(Gateway)
-    gw._agent_manager = agent_manager
-    gw._thread_registry = MagicMock()
-    gw._thread_registry.get_session = MagicMock(return_value=session)
-    gw._require_session = MagicMock(return_value=session)
-    gw._bump_dashboard_session = MagicMock()
-    gw.push_text = AsyncMock()
-    gw._resolve_push_subject = MagicMock(return_value=MagicMock())
+    gateway = MagicMock()
+    gateway.run_in_session = _run_locked
+    gateway.require_session = MagicMock(return_value=session)
+    gateway.push_session_text = AsyncMock()
+    gateway.notify_dashboard_push = AsyncMock()
 
-    await Gateway.push_text_from_session(
-        gw,
-        "a1",
-        "a1:dashboard:1:dm",
-        "cron prompt",
-        task_type="agent",
-        mcp_servers=[],
+    service = CronDeliveryService(
+        gateway=gateway,
+        agent_manager=agent_manager,
+        repos=MagicMock(),
     )
+    await service.deliver(_command(mcp_servers=()))
 
-    agent_manager.merge_turn_mcp_servers.assert_called_once_with(1, None, apply_defaults=True)
+    agent_manager.merge_turn_mcp_servers.assert_called_once_with(
+        1, None, apply_defaults=True, extra_defaults=[]
+    )
     agent_manager.prepare_chat_mcp.assert_awaited()
-    gw.push_text.assert_awaited()
+    gateway.push_session_text.assert_awaited()
 
 
 @pytest.mark.asyncio
-async def test_push_text_from_session_explicit_mcp_overrides_defaults() -> None:
-    """Cron with explicit mcp_servers uses only the user's selection."""
-    from octop.infra.gateway.gateway import Gateway
-
-    session = MagicMock()
-    session.channel_type = "dashboard"
-    session.thread_id = "thr1"
-    session.user_id = 1
-    session.channel_id = None
-    session.to_channel_subject = MagicMock(return_value=MagicMock())
-
+async def test_deliver_agent_explicit_mcp_overrides_defaults() -> None:
+    session = _dashboard_session()
     agent_row = MagicMock()
     agent_row.default_model = None
 
@@ -161,29 +161,83 @@ async def test_push_text_from_session_explicit_mcp_overrides_defaults() -> None:
 
     agent_manager = MagicMock()
     agent_manager.merge_turn_mcp_servers = MagicMock(return_value=["picked__1"])
+    agent_manager.default_mcp_servers = MagicMock(return_value=[])
     agent_manager.prepare_chat_mcp = AsyncMock(return_value=[])
     agent_manager.stream = _stream
     agent_manager.get_row = MagicMock(return_value=agent_row)
 
-    gw = Gateway.__new__(Gateway)
-    gw._agent_manager = agent_manager
-    gw._thread_registry = MagicMock()
-    gw._thread_registry.get_session = MagicMock(return_value=session)
-    gw._require_session = MagicMock(return_value=session)
-    gw._bump_dashboard_session = MagicMock()
-    gw.push_text = AsyncMock()
-    gw._resolve_push_subject = MagicMock(return_value=MagicMock())
+    gateway = MagicMock()
+    gateway.run_in_session = _run_locked
+    gateway.require_session = MagicMock(return_value=session)
+    gateway.push_session_text = AsyncMock()
+    gateway.notify_dashboard_push = AsyncMock()
 
-    await Gateway.push_text_from_session(
-        gw,
-        "a1",
-        "a1:dashboard:1:dm",
-        "cron prompt",
-        task_type="agent",
-        mcp_servers=["picked__1"],
+    service = CronDeliveryService(
+        gateway=gateway,
+        agent_manager=agent_manager,
+        repos=MagicMock(),
     )
+    await service.deliver(_command(mcp_servers=("picked__1",)))
 
     agent_manager.merge_turn_mcp_servers.assert_called_once_with(
-        1, ["picked__1"], apply_defaults=False
+        1, ["picked__1"], apply_defaults=False, extra_defaults=[]
     )
-    gw.push_text.assert_awaited()
+    gateway.push_session_text.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deliver_agent_attaches_expert_knowledge_bases() -> None:
+    session = _dashboard_session()
+    agent_row = MagicMock()
+    agent_row.default_model = None
+    visible = [
+        SimpleNamespace(
+            id="owned-default",
+            owner_user_id=1,
+            default_open=True,
+            name="Always",
+            description="",
+        ),
+        SimpleNamespace(
+            id="expert-pick",
+            owner_user_id=1,
+            default_open=False,
+            name="Policies",
+            description="Refund rules",
+        ),
+    ]
+
+    async def _stream(_aid: str, request: dict):
+        configurable = request.get("configurable") or {}
+        assert configurable["knowledge_base_ids"] == ["owned-default", "expert-pick"]
+        assert configurable["knowledge_base_catalog"] == [
+            {"id": "owned-default", "name": "Always", "description": ""},
+            {"id": "expert-pick", "name": "Policies", "description": "Refund rules"},
+        ]
+        yield {"type": "token", "content": "ok"}
+
+    agent_manager = MagicMock()
+    agent_manager.merge_turn_mcp_servers = MagicMock(return_value=None)
+    agent_manager.default_mcp_servers = MagicMock(return_value=[])
+    agent_manager.default_knowledge_base_ids = MagicMock(return_value=["expert-pick", "gone"])
+    agent_manager.prepare_chat_mcp = AsyncMock(return_value=[])
+    agent_manager.stream = _stream
+    agent_manager.get_row = MagicMock(return_value=agent_row)
+
+    repos = MagicMock()
+    repos.knowledge_repo.list_visible.return_value = visible
+    repos.user_repo.get.return_value = MagicMock(role="user")
+
+    gateway = MagicMock()
+    gateway.run_in_session = _run_locked
+    gateway.require_session = MagicMock(return_value=session)
+    gateway.push_session_text = AsyncMock()
+    gateway.notify_dashboard_push = AsyncMock()
+
+    service = CronDeliveryService(
+        gateway=gateway,
+        agent_manager=agent_manager,
+        repos=repos,
+    )
+    await service.deliver(_command())
+    gateway.push_session_text.assert_awaited()

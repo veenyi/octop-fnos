@@ -21,6 +21,10 @@ from octop.api.common.agent import require_agent_owner_row, user_owns_agent
 from octop.api.common.agent_runtime import AgentRuntimeFields, runtime_field_updates
 from octop.api.common.validators import assert_user_backend_root_dirs
 from octop.api.deps import current_user, get_server
+from octop.infra.agents.avatar import (
+    display_published_expert_icon_url,
+    read_snapshot_avatar,
+)
 from octop.infra.agents.experts.catalog import (
     MANIFEST_FILENAME,
     build_create_spec_from_expert,
@@ -59,9 +63,29 @@ from octop.infra.agents.experts.skillhub_market import (
     fetch_skillset,
 )
 from octop.infra.errors import ErrorCode, OctopError
+from octop.infra.trajectory.settings import apply_enable_trajectory
 from octop.infra.utils.locale import resolve_user_locale
 
 router = APIRouter()
+
+
+def _validated_session_defaults(
+    registry: Any,
+    user_id: int,
+    *,
+    knowledge_base_ids: list[str] | None,
+    mcp_servers: list[str] | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    kb_ids = (
+        registry.validate_knowledge_base_ids(user_id, knowledge_base_ids)
+        if knowledge_base_ids is not None
+        else None
+    )
+    servers = (
+        registry.validate_mcp_servers(user_id, mcp_servers) if mcp_servers is not None else None
+    )
+    return kb_ids, servers
+
 
 _SAFE_MARKET_REASONS: dict[SkillHubMarketErrorKind, str] = {
     SkillHubMarketErrorKind.NOT_FOUND: "expert not found",
@@ -82,6 +106,8 @@ class FromExpertBody(AgentRuntimeFields):
     default_model: str | None = None
     backend: dict[str, Any] | None = None
     skill_package_ids: list[str] | None = None
+    knowledge_base_ids: list[str] | None = None
+    mcp_servers: list[str] | None = None
     color: str | None = None
     agent_id: str | None = Field(
         default=None,
@@ -89,6 +115,7 @@ class FromExpertBody(AgentRuntimeFields):
         description="Optional custom agent id; auto-generated when omitted",
     )
     welcome_message: str | None = None
+    enable_trajectory: bool = True
 
 
 class PublishExpertBody(BaseModel):
@@ -115,6 +142,8 @@ class InstallPublishedExpertBody(AgentRuntimeFields):
     default_model: str | None = None
     backend: dict[str, Any] | None = None
     skill_package_ids: list[str] | None = None
+    knowledge_base_ids: list[str] | None = None
+    mcp_servers: list[str] | None = None
     color: str | None = None
     agent_id: str | None = Field(
         default=None,
@@ -122,6 +151,7 @@ class InstallPublishedExpertBody(AgentRuntimeFields):
         description="Optional custom agent id; auto-generated when omitted",
     )
     welcome_message: str | None = None
+    enable_trajectory: bool = True
 
 
 class LocalizedTextResponse(BaseModel):
@@ -282,6 +312,7 @@ def _published_creator_username(server: Any, created_by: str) -> str | None:
 
 
 def _published_summary_dict(row: Any, server: Any) -> dict[str, Any]:
+    snapshot_dir = _published_snapshot_dir(server, row.id)
     return {
         "id": row.id,
         "slug": row.slug,
@@ -291,6 +322,11 @@ def _published_summary_dict(row: Any, server: Any) -> dict[str, Any]:
         "creator_username": _published_creator_username(server, row.created_by),
         "source_agent_id": row.source_agent_id,
         "icon_name": row.icon_name or None,
+        "icon_url": display_published_expert_icon_url(
+            expert_id=row.id,
+            snapshot_dir=snapshot_dir,
+            updated_at=row.updated_at,
+        ),
         "color": row.color or None,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -312,6 +348,24 @@ async def list_published_experts(
         _published_summary_dict(row, server)
         for row in server.services.published_expert_repo.list_all()
     ]
+
+
+@router.get(
+    "/experts/published/{expert_id}/avatar",
+    summary="Fetch published expert avatar",
+)
+async def get_published_expert_avatar(
+    expert_id: str,
+    _: Any = Depends(current_user),
+    server: Any = Depends(get_server),
+) -> Response:
+    """Return the avatar bytes baked into the published snapshot, if any."""
+    row = _require_published_expert(server, expert_id)
+    found = read_snapshot_avatar(_published_snapshot_dir(server, row.id))
+    if found is None:
+        raise OctopError(ErrorCode.NOT_FOUND, "avatar not uploaded")
+    data, media_type = found
+    return Response(content=data, media_type=media_type)
 
 
 @router.get("/experts/published/{expert_id}", summary="Get published expert template detail")
@@ -451,7 +505,17 @@ async def install_published_expert(
     """Create a private agent and seed it from the immutable published snapshot."""
     assert server.app_runtime is not None
     assert server.services is not None
-    assert_user_backend_root_dirs(user, body.backend)
+    assert_user_backend_root_dirs(
+        user,
+        body.backend,
+        policy_repo=server.services.user_policy_repo,
+    )
+    kb_ids, servers = _validated_session_defaults(
+        server.app_runtime.agent_registry,
+        user.id,
+        knowledge_base_ids=body.knowledge_base_ids,
+        mcp_servers=body.mcp_servers,
+    )
     return await install_published_expert_agent(
         services=server.services,
         registry=server.app_runtime.agent_registry,
@@ -464,10 +528,13 @@ async def install_published_expert(
             default_model=body.default_model,
             backend=body.backend,
             skill_package_ids=body.skill_package_ids,
+            knowledge_base_ids=kb_ids,
+            mcp_servers=servers,
             color=body.color,
             agent_id=body.agent_id,
             welcome_message=body.welcome_message,
             runtime_config=runtime_field_updates(body, exclude_unset=True),
+            enable_trajectory=body.enable_trajectory,
         ),
     )
 
@@ -535,7 +602,11 @@ async def install_expert_hub_item(
 ) -> dict[str, Any]:
     """Create an agent from a SkillHub skillset-backed expert template."""
     assert server.app_runtime is not None
-    assert_user_backend_root_dirs(user, body.backend)
+    assert_user_backend_root_dirs(
+        user,
+        body.backend,
+        policy_repo=server.services.user_policy_repo,
+    )
     package_ids = (
         server.app_runtime.agent_registry.validate_skill_package_ids(body.skill_package_ids)
         if body.skill_package_ids is not None
@@ -543,6 +614,12 @@ async def install_expert_hub_item(
     )
     if package_ids:
         server.app_runtime.agent_registry.assert_backend_supports_skill_packages(body.backend)
+    kb_ids, servers = _validated_session_defaults(
+        server.app_runtime.agent_registry,
+        user.id,
+        knowledge_base_ids=body.knowledge_base_ids,
+        mcp_servers=body.mcp_servers,
+    )
     try:
         result = await create_skillhub_market_agent(
             server=server,
@@ -557,6 +634,10 @@ async def install_expert_hub_item(
                 color=body.color,
                 agent_id=body.agent_id,
                 welcome_message=body.welcome_message,
+                skill_package_ids=package_ids,
+                knowledge_base_ids=kb_ids,
+                mcp_servers=servers,
+                enable_trajectory=body.enable_trajectory,
                 **runtime_field_updates(body, exclude_unset=False),
             ),
         )
@@ -564,8 +645,6 @@ async def install_expert_hub_item(
         raise _map_skillhub_error(exc) from exc
 
     row = result.row
-    if package_ids is not None:
-        await server.app_runtime.agent_registry.persist_skill_package_ids(row.agent_id, package_ids)
     return {
         "id": row.id,
         "agent_id": row.agent_id,
@@ -614,7 +693,11 @@ async def create_agent_from_expert(
     if expert is None:
         raise OctopError(ErrorCode.NOT_FOUND, f"expert {expert_id!r} not found")
     assert server.app_runtime is not None
-    assert_user_backend_root_dirs(user, body.backend)
+    assert_user_backend_root_dirs(
+        user,
+        body.backend,
+        policy_repo=server.services.user_policy_repo,
+    )
     package_ids = (
         server.app_runtime.agent_registry.validate_skill_package_ids(body.skill_package_ids)
         if body.skill_package_ids is not None
@@ -622,12 +705,19 @@ async def create_agent_from_expert(
     )
     if package_ids:
         server.app_runtime.agent_registry.assert_backend_supports_skill_packages(body.backend)
+    kb_ids, servers = _validated_session_defaults(
+        server.app_runtime.agent_registry,
+        user.id,
+        knowledge_base_ids=body.knowledge_base_ids,
+        mcp_servers=body.mcp_servers,
+    )
 
     config_extra: dict[str, Any] = {}
     if body.providers:
         config_extra["providers"] = list(body.providers)
     if body.backend:
         config_extra["backend"] = body.backend
+    apply_enable_trajectory(config_extra, body.enable_trajectory)
 
     locale = resolve_user_locale(
         user_repo=server.services.user_repo,
@@ -646,10 +736,11 @@ async def create_agent_from_expert(
         agent_id=body.agent_id,
         color=body.color,
         welcome_message=body.welcome_message,
+        skill_package_ids=package_ids,
+        knowledge_base_ids=kb_ids,
+        mcp_servers=servers,
     )
     row = await server.app_runtime.agent_registry.create(spec, defer_bootstrap=True)
-    if package_ids is not None:
-        await server.app_runtime.agent_registry.persist_skill_package_ids(row.agent_id, package_ids)
     return {
         "id": row.id,
         "agent_id": row.agent_id,

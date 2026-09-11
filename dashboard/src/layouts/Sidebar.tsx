@@ -33,6 +33,7 @@ import {
 } from "./sidebarNav";
 import styles from "./Sidebar.module.less";
 import { typeSize } from "../utils/mobileTypeScale";
+import { DESKTOP_DRAG_REGION_CLASS } from "../utils/desktopChrome";
 
 const NAV_GROUPS_STORAGE_KEY = "octop:sidebar-nav-groups";
 /** Minimal settings pane: skip the "设置" group header (duplicates the pane title). */
@@ -67,6 +68,11 @@ function useNavGroupCollapse(navSections: NavSection[], selectedKey: string) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() =>
     loadCollapsedGroups(),
   );
+  const activeGroupKey = navSections.find(
+    (section) =>
+      section.groupKey &&
+      section.items.some((item) => item.key === selectedKey),
+  )?.groupKey;
 
   const toggleGroup = useCallback((groupKey: string) => {
     setCollapsedGroups((prev) => {
@@ -84,20 +90,15 @@ function useNavGroupCollapse(navSections: NavSection[], selectedKey: string) {
   );
 
   useEffect(() => {
-    const activeSection = navSections.find(
-      (section) =>
-        section.groupKey &&
-        section.items.some((item) => item.key === selectedKey),
-    );
-    if (!activeSection?.groupKey) return;
+    if (!activeGroupKey) return;
     setCollapsedGroups((prev) => {
-      if (!prev.has(activeSection.groupKey!)) return prev;
+      if (!prev.has(activeGroupKey)) return prev;
       const next = new Set(prev);
-      next.delete(activeSection.groupKey!);
+      next.delete(activeGroupKey);
       saveCollapsedGroups(next);
       return next;
     });
-  }, [selectedKey, navSections]);
+  }, [activeGroupKey, selectedKey]);
 
   return { toggleGroup, isGroupCollapsed };
 }
@@ -722,7 +723,7 @@ export default function Sidebar({
       }}
     >
       <div
-        className={styles.sidebarBrand}
+        className={`${styles.sidebarBrand} ${DESKTOP_DRAG_REGION_CLASS}`}
         style={{
           display: "flex",
           alignItems: "center",

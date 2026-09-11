@@ -17,6 +17,7 @@ from octop.infra.gateway.process.response_mode import (
     collapse_to_invoke_response,
     normalize_channel_response_mode,
     processor_for_response_mode,
+    qq_channel_response_mode,
 )
 
 
@@ -47,6 +48,27 @@ async def test_invoke_discards_progress_before_tool_and_emits_final_once() -> No
     text = result[0].content[0]
     assert isinstance(text, TextContent)
     assert text.text == "这是最终答案。"
+
+
+@pytest.mark.asyncio
+async def test_invoke_strips_orphan_thinking_prefix_from_final_text() -> None:
+    source = _events(
+        MessageEvent.delta("Let me inspect another source. "),
+        MessageEvent.delta("This is internal reasoning."),
+        MessageEvent.delta("</think>"),
+        MessageEvent.delta("【每日指南学习】最终内容"),
+        MessageEvent.completed(),
+    )
+
+    result = [event async for event in collapse_to_invoke_response(source)]
+
+    assert [event.type for event in result] == [
+        MessageEventType.MESSAGE,
+        MessageEventType.COMPLETED,
+    ]
+    text = result[0].content[0]
+    assert isinstance(text, TextContent)
+    assert text.text == "【每日指南学习】最终内容"
 
 
 @pytest.mark.asyncio
@@ -94,3 +116,12 @@ def test_stream_mode_uses_original_processor() -> None:
 
     assert processor_for_response_mode(processor, "stream") is processor
     assert processor_for_response_mode(processor, "invoke") is not processor
+
+
+def test_qq_channel_streams_by_default() -> None:
+    assert qq_channel_response_mode({}) == "stream"
+    assert qq_channel_response_mode({"response_mode": "invoke"}) == "stream"
+    assert qq_channel_response_mode({"streaming": False}) == "stream"
+    assert qq_channel_response_mode({"c2c_streaming": True}) == "stream"
+    assert qq_channel_response_mode({"c2c_streaming": False}) == "invoke"
+    assert qq_channel_response_mode({"c2c_streaming": "false"}) == "invoke"

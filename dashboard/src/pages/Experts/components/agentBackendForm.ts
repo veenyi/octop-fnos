@@ -63,7 +63,8 @@ export type RootDirProbeCode =
   | "permission_denied"
   | "write_failed"
   | "not_allowed"
-  | "outside_home";
+  | "outside_home"
+  | "outside_root";
 
 export interface RootDirProbeResult {
   ok: boolean;
@@ -168,7 +169,7 @@ export async function ensureBubblewrapAfterProbe(): Promise<EnsureBwrapResult> {
 export function ensureBwrapToastKind(
   status: EnsureBwrapStatus,
 ): "none" | "success" | "warning" {
-  if (status === "ready") return "none";
+  if (status === "ready" || status === "skipped") return "none";
   if (status === "installed") return "success";
   return "warning";
 }

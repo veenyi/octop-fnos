@@ -71,6 +71,22 @@
       "pending_line": "`{pending_id}` — {count} 个工具",
       "dashboard_hint": "控制台聊天请使用审批卡片；IM 通道请使用 `/approve` 或 `/reject`。"
     },
+    "ask": {
+      "card_title": "❓ 有个地方需要你拍板",
+      "progress": "第 {current}/{total} 个问题",
+      "question_line": "**{index}. {question}**",
+      "question_line_headed": "**{index}. [{header}] {question}**",
+      "option_line": "   {opt}) {label}",
+      "option_line_desc": "   {opt}) {label} —— {description}",
+      "multi_hint": "   （可多选，如 `a,c`）",
+      "open_hint": "   （直接用一句话回答）",
+      "card_footer": "直接回复序号（如 `a`），或输入你自己的答案。",
+      "card_pending_id": "提问 ID：`{pending_id}`（30 分钟内有效）",
+      "answer_ack": "收到，继续处理…",
+      "answer_recorded": "✅ 已记录，下面是下一个问题。",
+      "not_owner": "仅被提问的用户可以回答。",
+      "answered_prefix": "用户回答："
+    },
     "title": {
       "usage": "用法：/title <标题>",
       "done": "标题已设置：{title}"
@@ -280,13 +296,24 @@
       }
     }
   },
+  "connector": {
+    "oauth": {
+      "callback_auth_failed": "授权失败：{error}",
+      "callback_missing_params": "缺少 code 或 state。",
+      "callback_invalid_state": "无效或过期的 state。",
+      "callback_token_exchange_failed": "Token 交换失败：{detail}",
+      "callback_save_failed": "保存授权失败：{detail}",
+      "callback_success": "授权完成，可关闭此窗口。"
+    }
+  },
   "errors": {
     "AUTH_FAILED": "认证失败。",
     "TOKEN_EXPIRED": "登录已过期，请重新登录。",
     "SETUP_REQUIRED": "需要完成初始设置。",
     "DATABASE_NOT_EMPTY": "目标数据库已有用户。请改用空库，或直接登录现有管理员账户。",
     "BACKUP_DRIVER_MISMATCH": "该备份与当前数据库引擎不一致（SQLite 与 PostgreSQL 不能互恢）。请将运行时切回备份所用引擎后再恢复，或在当前引擎上重新备份。暂不支持跨引擎恢复。",
-    "BACKUP_IN_PROGRESS": "已有备份任务正在进行，请稍后再试。",
+    "BACKUP_SCHEMA_INCOMPATIBLE": "该备份使用数据库结构版本 {archive_schema_version}，当前 Octop 版本无法恢复（最高支持版本：{runtime_schema_version}）。",
+    "BACKUP_IN_PROGRESS": "已有备份或恢复任务正在进行，请稍后再试。",
     "FORBIDDEN": "没有权限。",
     "NOT_FOUND": "未找到。",
     "USER_DISABLED": "账号已禁用。",
@@ -312,10 +339,12 @@
     "PROVIDER_LOCAL_PROTECTED": "本地提供商无法删除。",
     "STORAGE_BACKEND_NAME_TAKEN": "存储后端名称已被占用。",
     "STORAGE_BACKEND_REFERENCED": "存储后端正在使用中，无法删除。",
+    "STORAGE_BACKEND_DEPS_FAILED": "无法安装此后端所需的可选组件。请检查网络后重试。",
     "CHANNEL_KIND_UNSUPPORTED": "不支持的通道类型。",
     "CHANNEL_INVALID_CREDENTIALS": "通道凭证无效。",
     "CHANNEL_NAME_TAKEN": "该通道名称已被使用，请换一个名称。",
     "CONNECTOR_NOT_FOUND": "未找到连接器。",
+    "CONNECTOR_NAME_TAKEN": "该连接器名称已被使用，请换一个名称。",
     "CONNECTOR_INVALID_CREDENTIALS": "连接器凭证无效。",
     "CONNECTOR_OAUTH_HTTPS_REQUIRED": "当前通过公网 HTTP 访问 Octop，Notion 授权回调地址需要 HTTPS。请改用 HTTPS，或通过 localhost、127.0.0.1 在本机访问 Octop。",
     "CONNECTOR_KIND_UNSUPPORTED": "不支持的连接器类型。",
@@ -341,7 +370,7 @@
     "SKILL_ALREADY_EXISTS": "技能 {name} 已存在，如需覆盖请启用 overwrite。",
     "SKILL_PACKAGE_NOT_FOUND": "未找到技能包。",
     "SKILL_PACKAGE_NAME_TAKEN": "技能包 {name} 已存在。",
-    "SKILL_PACKAGE_BACKEND_UNSUPPORTED": "技能包目前仅支持「本地完整环境（文件系统+指令执行）」或「本地文件系统（不能执行指令）」，且存储根目录须为 /（POSIX）或 Agent 工作区根目录（Windows 默认）。",
+    "SKILL_PACKAGE_BACKEND_UNSUPPORTED": "技能包目前仅支持「本地完整环境（文件系统+指令执行）」或「本地文件系统（不能执行指令）」，且存储根目录须为 /（POSIX）或专家的工作区根目录（Windows 默认）。",
     "PUBLISHED_EXPERT_SLUG_TAKEN": "已存在发布专家 slug：{slug}。",
     "PUBLISHED_EXPERT_ALREADY_EXISTS": "该专家已发布为「{name}」，请改为刷新已发布模板。",
     "OIDC_BAD_REQUEST": "OIDC 请求无效：{detail}",
@@ -368,7 +397,9 @@
     "INVITE_USED": "该邀请码已被使用。",
     "INVITE_EXPIRED": "该邀请码已过期。",
     "INVITE_REVOKED": "该邀请码已被撤销。",
-    "INVITE_RATE_LIMITED": "邀请尝试次数过多，请稍后再试。"
+    "INVITE_RATE_LIMITED": "邀请尝试次数过多，请稍后再试。",
+    "WORKSPACE_ROOT_RESTRICTED": "所选存储根目录超出了该账号允许的范围。",
+    "TOKEN_QUOTA_EXCEEDED": "该账号已达到 token 配额上限，请联系管理员提升额度（{used}/{quota}）。"
   },
   "desktop": {
     "install_log_deps": "正在安装 Python 依赖…",
@@ -482,6 +513,7 @@
     "mobile_handoff_to_user": "交给用户操作（手机）",
     "read_env_file": "读取环境变量",
     "write_env_file": "写入环境变量",
+    "ask_user_question": "向你提问",
     "generate_image": "生成图片",
     "generate_video": "生成视频"
   },
@@ -531,6 +563,11 @@
     "fork_title_suffix": "（分叉）",
     "fork_default_title": "分叉对话"
   },
+  "cron": {
+    "history": {
+      "executed": "任务{cron_id} :{name} 执行."
+    }
+  },
   "agents": {
     "state": {
       "running": "运行中",
@@ -551,6 +588,7 @@
     "stream_stall": "模型响应中断：连接仍在，但长时间没有新内容。请点击「重试」，或稍后更换模型再试。若经常出现，请检查供应商状态，或联系管理员排查流式超时设置。",
     "rate_limit": "模型请求过于频繁，已被限流。请稍等片刻后重试，或切换其他模型。",
     "auth": "模型服务鉴权失败。请检查「设置 → 模型」中的 API Key 是否正确、是否过期。",
+    "insufficient_balance": "模型服务返回余额或额度不足。请为该 API Key 对应的账户充值或升级套餐后再试。",
     "context_length": "对话上下文过长，超出模型限制。请新开会话，或精简历史后再试。",
     "recursion_limit": "智能体已达到最大迭代次数（递归上限），任务尚未完成。请前往「运行配置」调高「最大迭代次数」后重试。",
     "timeout_network": "连接模型服务超时或网络异常。请检查网络后重试；若使用代理或自建服务，请确认其可达。",
@@ -586,7 +624,63 @@
     "error_script_missing": "Octop 包中缺少移动设备安装脚本。",
     "error_docker_missing": "安装 Android 容器后端需要 Docker。",
     "error_command_failed": "命令失败（退出码 {exit_code}）。",
+    "docker_missing_auto_install": "未检测到 Docker，正在尝试自动安装（官方 get.docker.com 脚本，按延迟测速选择安装源）…",
+    "docker_auto_install_ok": "Docker 安装成功。",
+    "docker_auto_install_failed": "Docker 自动安装失败。",
+    "docker_source_official": "测速完成：官方源 download.docker.com 延迟最低，使用官方安装源。",
+    "docker_source_selected": "测速完成：延迟最低的源是 {source}（{delay} 秒），将通过 DOWNLOAD_URL 传给官方安装脚本。",
+    "docker_source_fallback": "无法测速各安装源，将直接使用官方安装脚本的默认源。",
+    "docker_install_log_start": "正在运行内置的官方 Docker 安装脚本…",
+    "docker_install_script_failed": "Docker 安装脚本执行失败（退出码 {exit_code}）。",
+    "docker_install_script_missing": "Octop 包中缺少内置的 Docker 安装脚本。",
+    "docker_install_spawn_failed": "无法启动 Docker 安装脚本：{error}",
+    "docker_install_stalled": "Docker 安装脚本长时间无输出，已停止。请检查网络或包管理器状态后重试。",
+    "docker_hint_unsupported_distro": "当前 Linux 发行版不受 Docker 安装脚本支持，请参考 https://docs.docker.com/engine/install/ 手动安装。",
+    "docker_hint_no_root": "安装脚本需要 root 或免密 sudo 权限。请授权后重试，或手动安装 Docker。",
+    "docker_hint_already_installed": "脚本检测到主机已有 Docker。若其已损坏，请先卸载后重试。",
+    "docker_hint_network": "安装脚本无法下载软件包（网络 / curl / DNS 问题）。请检查网络或配置代理后重试。",
+    "docker_hint_pkg_manager": "系统包管理器执行失败（锁被占用、索引损坏或步骤中断）。请处理后重试（如 sudo apt clean && sudo apt update）。",
+    "docker_hint_gpg_key": "无法获取或校验 Docker 仓库的 GPG 密钥。请检查网络 / 镜像源后重试。",
+    "docker_hint_disk_full": "磁盘空间不足，无法安装 Docker。请清理空间后重试。",
+    "docker_mirror_reachable": "腾讯云镜像加速可达，将配置为 registry mirror。",
+    "docker_mirror_unreachable": "腾讯云镜像加速不可达，保持默认 registry 配置。",
+    "docker_mirror_skipped": "registry-mirrors 已配置（或 daemon.json 无法读取），保持不变。",
+    "docker_mirror_configured": "镜像加速已写入 /etc/docker/daemon.json（原文件已备份为 daemon.json.backup）。",
+    "docker_restart_ok": "Docker 守护进程已重启。",
+    "docker_restart_ready": "Docker 守护进程已就绪并正常响应。",
+    "docker_restart_failed": "Docker 重启失败（可能无 systemd/service 管理器，或服务未能恢复）。镜像加速配置将在下次 Docker 重启后生效——必要时请手动启动（systemctl restart docker 或 service docker restart）。",
     "handoff_message": "请在设备上完成此步骤：{reason}",
     "handoff_default": "需要在设备上手动操作"
+  },
+  "usage_export": {
+    "sheet_detail": "明细",
+    "sheet_by_day": "按天",
+    "sheet_by_agent": "按专家",
+    "sheet_by_model": "按模型",
+    "chart_daily": "每日 Token",
+    "chart_by_agent": "按专家 Token",
+    "chart_by_model": "按模型 Token",
+    "col_time": "时间",
+    "col_user_id": "用户 ID",
+    "col_username": "用户名",
+    "col_agent_id": "专家 ID",
+    "col_agent_name": "专家名称",
+    "col_thread_id": "会话 ID",
+    "col_model": "模型",
+    "col_input_tokens": "输入 tokens",
+    "col_uncached_input_tokens": "非缓存输入",
+    "col_cache_read_tokens": "缓存读取",
+    "col_cache_write_tokens": "缓存写入",
+    "col_output_tokens": "输出 tokens",
+    "col_reasoning_tokens": "推理 tokens",
+    "col_total_tokens": "总 tokens",
+    "col_model_calls": "模型调用次数",
+    "col_source": "来源",
+    "col_date": "日期",
+    "col_turns": "轮次",
+    "col_key": "键",
+    "row_total": "合计",
+    "axis_tokens": "Token 数",
+    "filename_prefix": "Token用量"
   }
 }

@@ -14,6 +14,8 @@ from harness_gateway.models import (
     TextContent,
 )
 
+from octop.infra.utils.llm_text import strip_thinking
+
 ChannelResponseMode = Literal["invoke", "stream"]
 
 DEFAULT_CHANNEL_RESPONSE_MODE: ChannelResponseMode = "invoke"
@@ -24,6 +26,21 @@ def normalize_channel_response_mode(value: Any) -> ChannelResponseMode:
     if isinstance(value, str) and value.strip().lower() == "stream":
         return "stream"
     return DEFAULT_CHANNEL_RESPONSE_MODE
+
+
+def _config_flag(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def qq_channel_response_mode(config: dict[str, Any]) -> ChannelResponseMode:
+    """QQ C2C stream is on by default. Explicit ``c2c_streaming: false`` opts out."""
+    if _config_flag(config.get("c2c_streaming"), default=True):
+        return "stream"
+    return "invoke"
 
 
 async def collapse_to_invoke_response(
@@ -81,7 +98,7 @@ async def collapse_to_invoke_response(
 
         if event.type == MessageEventType.COMPLETED:
             content: list[ContentPart] = []
-            final_text = text_buffer.strip()
+            final_text = strip_thinking(text_buffer)
             if final_text:
                 content.append(TextContent(text=final_text))
             content.extend(media_buffer)
@@ -115,4 +132,5 @@ __all__ = [
     "collapse_to_invoke_response",
     "normalize_channel_response_mode",
     "processor_for_response_mode",
+    "qq_channel_response_mode",
 ]

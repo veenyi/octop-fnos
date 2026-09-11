@@ -20,6 +20,7 @@ from octop.infra.agents.experts.skillhub_market import (
     install_skillset_template,
 )
 from octop.infra.errors import ErrorCode, OctopError
+from octop.infra.trajectory.settings import apply_enable_trajectory
 from octop.infra.utils.locale import resolve_user_locale
 
 logger = logging.getLogger(__name__)
@@ -48,11 +49,15 @@ class SkillHubMarketAgentCreateOptions:
     color: str | None = None
     agent_id: str | None = None
     welcome_message: str | None = None
+    skill_package_ids: list[str] | None = None
+    knowledge_base_ids: list[str] | None = None
+    mcp_servers: list[str] | None = None
     max_iters: int | None = None
     max_input_length: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     max_tokens: int | None = None
+    enable_trajectory: bool = True
 
 
 @dataclass(frozen=True)
@@ -281,6 +286,7 @@ async def create_agent_from_skillhub_skillset(
         config_extra["providers"] = list(options.providers)
     if options.backend:
         config_extra["backend"] = options.backend
+    apply_enable_trajectory(config_extra, options.enable_trajectory)
 
     locale = resolve_user_locale(
         user_repo=server.services.user_repo,
@@ -311,6 +317,9 @@ async def create_agent_from_skillhub_skillset(
         icon_url=item.icon_url or None,
         color=options.color,
         welcome_message=(options.welcome_message if customized_welcome else None),
+        skill_package_ids=options.skill_package_ids,
+        knowledge_base_ids=options.knowledge_base_ids,
+        mcp_servers=options.mcp_servers,
     )
     row = await server.app_runtime.agent_registry.create(spec, defer_bootstrap=True)
 

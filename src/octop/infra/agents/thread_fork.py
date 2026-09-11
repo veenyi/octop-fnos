@@ -7,6 +7,7 @@ forked thread without prefilling the previous user question.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -187,9 +188,30 @@ async def fork_dashboard_thread(
     content: str | None = None,
     assistant_turns_from_end: int | None = None,
     locale: str = "en",
+    thread_message_repo: Any | None = None,
+    history_archive: Any | None = None,
 ) -> dict[str, Any]:
     """Create a dashboard thread seeded through the selected assistant reply."""
-    messages = await load_checkpoint_messages(harness, source.thread_id)
+    from langchain_core.messages import message_to_dict, messages_from_dict  # noqa: PLC0415
+
+    from octop.infra.history.legacy import checkpoint_wires  # noqa: PLC0415
+    from octop.infra.history.service import HistoryArchive  # noqa: PLC0415
+
+    archive = history_archive if isinstance(history_archive, HistoryArchive) else None
+    versioned = archive is not None
+    segments = (
+        await asyncio.to_thread(archive.store.segments, source.thread_id)
+        if archive is not None
+        else []
+    )
+    if archive is not None and segments:
+
+        async def read_legacy(anchor: dict[str, Any]) -> list[Any]:
+            return await checkpoint_wires(harness, source.thread_id, anchor)
+
+        messages = messages_from_dict(await archive.all_messages(source.thread_id, read_legacy))
+    else:
+        messages = await load_checkpoint_messages(harness, source.thread_id)
     idx = find_assistant_fork_index(
         messages,
         message_id=message_id,
@@ -198,6 +220,18 @@ async def fork_dashboard_thread(
     )
     # Include the selected assistant message (and any tool traffic before it).
     prefix = messages[: idx + 1]
+    prefix_projection_inputs: list[Any] | None = None
+    if thread_message_repo is not None:
+        from octop.infra.gateway.process.history_projection import (  # noqa: PLC0415
+            message_inputs,
+        )
+
+        projection_inputs = message_inputs(messages)
+        prefix_projection_inputs = message_inputs(prefix)
+        # A fork already paid the explicit full-history read cost. Reuse it to
+        # heal an empty read model instead of decoding the source again later.
+        if not versioned:
+            thread_message_repo.append_if_ready(source.thread_id, projection_inputs)
 
     session_key = ThreadRegistry.dashboard_key(agent_id=source.agent_id, user_id=user_id)
     dest_id = thread_registry.create_thread(
@@ -210,7 +244,22 @@ async def fork_dashboard_thread(
     )
     try:
         await write_checkpoint_messages(harness, thread_id=dest_id, messages=prefix)
+        fork_turn = (
+            await asyncio.to_thread(archive.begin, source.agent_id, dest_id)
+            if archive is not None
+            else None
+        )
+        if fork_turn is not None and archive is not None:
+            await asyncio.to_thread(
+                archive.save_messages, fork_turn, [message_to_dict(m) for m in prefix]
+            )
+            await asyncio.to_thread(archive.finish, fork_turn["id"], "complete")
+        elif thread_message_repo is not None:
+            assert prefix_projection_inputs is not None
+            thread_message_repo.append_if_ready(dest_id, prefix_projection_inputs)
     except Exception:
+        if archive is not None:
+            await asyncio.to_thread(archive.remove_thread, dest_id)
         thread_registry.delete_thread(dest_id)
         raise
 

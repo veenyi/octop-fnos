@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +40,7 @@ class _Base:
     embedding_model: str = "model"
     embedding_dim: int = 0
     doc_count: int = 0
+    max_documents: int = 100
     created_at: int = 1
     updated_at: int = 1
 
@@ -199,6 +201,7 @@ async def test_create_base_uses_selected_model_when_usable(
         "default_open": False,
         "shared": False,
         "icon_name": "",
+        "max_documents": 100,
     }
 
 
@@ -274,6 +277,86 @@ async def test_preview_document_returns_extracted_text(
 
 
 @pytest.mark.asyncio
+async def test_download_document_file_returns_original_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from octop.api.routers import knowledge_bases
+
+    path = tmp_path / "doc.pdf"
+    path.write_bytes(b"%PDF-1.4 test")
+    service = SimpleNamespace(
+        resolve_document_file=lambda *_args, **_kwargs: (
+            path,
+            "报告.pdf",
+            "application/pdf",
+        )
+    )
+    server = SimpleNamespace(services=_services())
+    user = SimpleNamespace(id=1, is_admin=False)
+    monkeypatch.setattr(knowledge_bases, "_knowledge_service", lambda _server: service)
+
+    response = await knowledge_bases.download_document_file(
+        "kb-1",
+        "doc-1",
+        request=_request(),
+        disposition="inline",
+        server=server,
+        user=user,
+    )
+
+    assert response.path == path
+    assert response.media_type == "application/pdf"
+    assert "inline" in response.headers["Content-Disposition"]
+    assert "filename*" in response.headers["Content-Disposition"]
+
+
+@pytest.mark.asyncio
+async def test_download_document_file_missing_maps_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from octop.api.routers import knowledge_bases
+
+    def missing(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("knowledge document original file not found")
+
+    service = SimpleNamespace(resolve_document_file=missing)
+    server = SimpleNamespace(services=_services())
+    user = SimpleNamespace(id=1, is_admin=False)
+    monkeypatch.setattr(knowledge_bases, "_knowledge_service", lambda _server: service)
+
+    with pytest.raises(OctopError) as raised:
+        await knowledge_bases.download_document_file(
+            "kb-1",
+            "doc-1",
+            request=_request(),
+            disposition="attachment",
+            server=server,
+            user=user,
+        )
+
+    assert raised.value.code == ErrorCode.KNOWLEDGE_NOT_FOUND
+
+
+def test_row_payload_includes_has_original(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from octop.api.routers import knowledge_bases
+    from octop.infra.knowledge import files as knowledge_files
+
+    monkeypatch.setattr(
+        knowledge_files,
+        "documents_dir",
+        lambda _kb_id: tmp_path,
+    )
+    doc = _Document(filename="notes.md")
+    missing = knowledge_bases._row_payload(doc)
+    assert missing["has_original"] is False
+
+    (tmp_path / f"{doc.id}.md").write_text("hi", encoding="utf-8")
+    present = knowledge_bases._row_payload(doc)
+    assert present["has_original"] is True
+    assert present["document_id"] == doc.id
+
+
+@pytest.mark.asyncio
 async def test_embedding_options_excludes_onnx_local_provider() -> None:
     from octop.api.routers import knowledge_bases
 
@@ -316,6 +399,38 @@ async def test_embedding_options_excludes_onnx_local_provider() -> None:
     assert all(row.get("recommended") for row in options["onnx"])
     assert all("downloaded" in row for row in options["onnx"])
     assert any(row.get("size_gb") for row in options["onnx"])
+
+
+@pytest.mark.asyncio
+async def test_ocr_options_only_lists_image_capable_models() -> None:
+    from octop.api.routers import knowledge_bases
+
+    provider = SimpleNamespace(
+        id=2,
+        name="OpenAI",
+        enabled=True,
+        api_key="sk-test",
+        base_url="https://example.test/v1",
+        get_models=lambda: [
+            {"id": "text-only", "name": "Text", "input": ["text"]},
+            {"id": "vision-1", "name": "Vision", "input": ["text", "image"]},
+            {"id": "embed-1", "name": "Embed", "embedding": True, "input": ["image"]},
+        ],
+    )
+    server = SimpleNamespace(
+        services=SimpleNamespace(provider_repo=SimpleNamespace(list_all=lambda: [provider]))
+    )
+
+    options = await knowledge_bases.ocr_options(server=server, _admin=object())
+
+    assert options["local"] == {"id": "rapidocr", "name": "RapidOCR (ONNX)"}
+    assert options["remote"] == [
+        {
+            "provider_id": "2",
+            "provider_name": "OpenAI",
+            "models": [{"id": "vision-1", "name": "Vision"}],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -550,3 +665,42 @@ async def test_rename_document_maps_invalid_name(
         )
 
     assert raised.value.code == ErrorCode.KNOWLEDGE_NAME_INVALID
+
+
+@pytest.mark.asyncio
+async def test_update_base_accepts_max_documents(monkeypatch: pytest.MonkeyPatch) -> None:
+    from octop.api.routers import knowledge_bases
+
+    received: dict[str, object] = {}
+
+    class _StubSvc:
+        def update_base(self, *_: object, **kw: object) -> object:
+            received.update(kw)
+            return _Base(max_documents=42)
+
+    monkeypatch.setattr(knowledge_bases, "_knowledge_service", lambda _s: _StubSvc())
+
+    response = await knowledge_bases.update_base(
+        kb_id="kb-1",
+        body=knowledge_bases.UpdateBaseBody(max_documents=42),
+        request=_request(),
+        server=SimpleNamespace(services=_services()),
+        user=SimpleNamespace(id=1, is_admin=False),
+    )
+    assert received["max_documents"] == 42
+    assert response["max_documents"] == 42
+
+
+@pytest.mark.asyncio
+async def test_update_base_rejects_max_documents_out_of_range() -> None:
+    from pydantic import ValidationError
+
+    from octop.api.routers import knowledge_bases
+
+    with pytest.raises(ValidationError):
+        knowledge_bases.UpdateBaseBody(max_documents=-1)
+    with pytest.raises(ValidationError):
+        knowledge_bases.UpdateBaseBody(max_documents=10_001)
+    assert knowledge_bases.UpdateBaseBody(max_documents=0).max_documents == 0
+    assert knowledge_bases.UpdateBaseBody(max_documents=10_000).max_documents == 10_000
+    assert knowledge_bases.UpdateBaseBody().max_documents is None

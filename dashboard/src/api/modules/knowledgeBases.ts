@@ -1,4 +1,4 @@
-import { request, requestUpload } from "../request";
+import { request, requestBlob, requestUpload } from "../request";
 
 export interface KnowledgeLimits {
   max_bases_per_owner: number;
@@ -19,6 +19,18 @@ export interface KnowledgeCapability {
     deps_available: boolean;
     provider_ready: boolean;
   };
+  ocr: {
+    enabled: boolean;
+    backend: "onnx" | "remote";
+    model: string;
+    provider_id: string;
+    prerequisites_ok: boolean;
+    usable: boolean;
+    checks: {
+      deps_available: boolean;
+      provider_ready: boolean;
+    };
+  };
   limits?: KnowledgeLimits;
 }
 
@@ -37,6 +49,7 @@ export interface KnowledgeBase {
   embedding_model: string;
   embedding_dim: number;
   doc_count: number;
+  max_documents: number;
   created_at: number;
   updated_at: number;
 }
@@ -56,6 +69,8 @@ export interface KnowledgeDocument {
   chunk_count: number;
   created_at: number;
   updated_at: number;
+  /** True when the uploaded original still exists on disk. */
+  has_original?: boolean;
 }
 
 export interface KnowledgeOnnxModel {
@@ -68,6 +83,15 @@ export interface KnowledgeOnnxModel {
 
 export interface KnowledgeEmbeddingOptions {
   onnx: KnowledgeOnnxModel[];
+  remote: {
+    provider_id: string;
+    provider_name: string;
+    models: { id: string; name: string }[];
+  }[];
+}
+
+export interface KnowledgeOcrOptions {
+  local: { id: "rapidocr"; name: string };
   remote: {
     provider_id: string;
     provider_name: string;
@@ -98,6 +122,10 @@ export const knowledgeBasesApi = {
     backend?: "onnx" | "remote";
     model?: string;
     provider_id?: string;
+    ocr_enabled?: boolean;
+    ocr_backend?: "onnx" | "remote";
+    ocr_model?: string;
+    ocr_provider_id?: string;
   }) =>
     request<KnowledgeCapability>("/knowledge-bases/feature", {
       method: "PUT",
@@ -111,6 +139,9 @@ export const knowledgeBasesApi = {
         ? "/knowledge-bases/embedding-options?all_onnx=true"
         : "/knowledge-bases/embedding-options",
     ),
+
+  getOcrOptions: () =>
+    request<KnowledgeOcrOptions>("/knowledge-bases/ocr-options"),
 
   downloadOnnx: (model: string) =>
     request<KnowledgeOnnxDownloadState>("/knowledge-bases/onnx-download", {
@@ -151,6 +182,7 @@ export const knowledgeBasesApi = {
     default_open?: boolean;
     shared?: boolean;
     icon_name?: string;
+    max_documents?: number;
   }) =>
     request<KnowledgeBase>("/knowledge-bases", {
       method: "POST",
@@ -165,6 +197,7 @@ export const knowledgeBasesApi = {
       default_open?: boolean;
       shared?: boolean;
       icon_name?: string;
+      max_documents?: number;
     },
   ) =>
     request<KnowledgeBase>(`/knowledge-bases/${id}`, {
@@ -221,7 +254,12 @@ export const knowledgeBasesApi = {
       },
     ),
 
-  uploadDocument: (id: string, file: File, relativePath?: string) => {
+  uploadDocument: (
+    id: string,
+    file: File,
+    relativePath?: string,
+    onProgress?: (percent: number) => void,
+  ) => {
     const body = new FormData();
     body.append("upload", file);
     if (relativePath) body.append("path", relativePath);
@@ -229,6 +267,7 @@ export const knowledgeBasesApi = {
       `/knowledge-bases/${id}/documents`,
       body,
       { method: "POST" },
+      onProgress,
     );
   },
 
@@ -246,6 +285,20 @@ export const knowledgeBasesApi = {
   previewDocument: (id: string, documentId: string) =>
     request<{ id: string; filename: string; text: string }>(
       `/knowledge-bases/${id}/documents/${documentId}/preview`,
+    ),
+
+  /** Authenticated original-file bytes (download or preview). */
+  fetchDocumentFile: (
+    id: string,
+    documentId: string,
+    disposition: "attachment" | "inline" = "attachment",
+    onProgress?: (loaded: number, total: number) => void,
+    signal?: AbortSignal,
+  ) =>
+    requestBlob(
+      `/knowledge-bases/${id}/documents/${documentId}/file?disposition=${disposition}`,
+      { signal },
+      onProgress,
     ),
 
   reindex: (id: string) =>

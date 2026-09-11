@@ -178,3 +178,154 @@ async def test_get_or_create_by_key_backfills_channel_id(registry: ThreadRegistr
     row = registry.get_session(sk)
     assert row is not None
     assert row.channel_id == "ch-feishu-1"
+    assert row.channel_metadata is not None
+    assert row.channel_metadata["channel_id"] == "ch-feishu-1"
+
+
+@pytest.mark.asyncio
+async def test_inbound_rebinds_session_to_replacement_channel(registry: ThreadRegistry) -> None:
+    """A deleted channel's id must not stay bound, or proactive push breaks."""
+    sk = ThreadRegistry.make_key(agent_id="a1", channel_type="feishu", channel_subject_id="ou_x")
+    await registry.get_or_create_by_key(
+        session_key=sk,
+        agent_id="a1",
+        user_id=1,
+        channel_type="feishu",
+        channel_channel_id="ch-old",
+    )
+    await registry.get_or_create_by_key(
+        session_key=sk,
+        agent_id="a1",
+        user_id=1,
+        channel_type="feishu",
+        channel_channel_id="ch-new",
+    )
+    row = registry.get_session(sk)
+    assert row is not None
+    assert row.channel_id == "ch-new"
+    assert row.channel_metadata is not None
+    assert row.channel_metadata["channel_id"] == "ch-new"
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_rebinds_replacement_channel(registry: ThreadRegistry) -> None:
+    await registry.get_or_create(
+        agent_id="a1",
+        user_id=1,
+        channel_type="feishu",
+        channel_subject_id="ou_x",
+        channel_id="ch-old",
+    )
+    await registry.get_or_create(
+        agent_id="a1",
+        user_id=1,
+        channel_type="feishu",
+        channel_subject_id="ou_x",
+        channel_id="ch-new",
+    )
+    sk = ThreadRegistry.make_key(agent_id="a1", channel_type="feishu", channel_subject_id="ou_x")
+    row = registry.get_session(sk)
+    assert row is not None
+    assert row.channel_id == "ch-new"
+    assert row.channel_metadata is not None
+    assert row.channel_metadata["channel_id"] == "ch-new"
+
+
+@pytest.mark.asyncio
+async def test_same_channel_id_does_not_rewrite_session(registry: ThreadRegistry) -> None:
+    sk = ThreadRegistry.make_key(agent_id="a1", channel_type="feishu", channel_subject_id="ou_x")
+    await registry.get_or_create_by_key(
+        session_key=sk,
+        agent_id="a1",
+        user_id=1,
+        channel_type="feishu",
+        channel_channel_id="ch-same",
+    )
+    before = registry.get_session(sk)
+    assert before is not None
+    await registry.get_or_create_by_key(
+        session_key=sk,
+        agent_id="a1",
+        user_id=1,
+        channel_type="feishu",
+        channel_channel_id="ch-same",
+    )
+    after = registry.get_session(sk)
+    assert after is not None
+    assert after.updated_at == before.updated_at
+    assert after.channel_id == "ch-same"
+
+
+@pytest.mark.asyncio
+async def test_metadata_refresh_keeps_bound_channel_id(registry: ThreadRegistry) -> None:
+    sk = ThreadRegistry.make_key(agent_id="a1", channel_type="feishu", channel_subject_id="ou_x")
+    await registry.get_or_create_by_key(
+        session_key=sk,
+        agent_id="a1",
+        user_id=1,
+        channel_type="feishu",
+        channel_channel_id="ch-keep",
+    )
+    await registry.get_or_create_by_key(
+        session_key=sk,
+        agent_id="a1",
+        user_id=1,
+        channel_type="feishu",
+        channel_metadata={"chat_id": "oc_1"},
+    )
+    row = registry.get_session(sk)
+    assert row is not None
+    assert row.channel_id == "ch-keep"
+    assert row.channel_metadata is not None
+    assert row.channel_metadata["channel_id"] == "ch-keep"
+    assert row.channel_metadata["chat_id"] == "oc_1"
+
+
+def test_peer_session_key_rewrites_agent_segment() -> None:
+    src = ThreadRegistry.make_key(
+        agent_id="a1",
+        channel_type="dashboard",
+        channel_subject_id="7",
+    )
+    out = ThreadRegistry.peer_session_key(src, "a2")
+    assert out == "a2:dashboard:7:dm"
+    assert ThreadRegistry.peer_session_key("not-a-key", "a2") is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_thread_is_stable_and_does_not_rebind(registry: ThreadRegistry) -> None:
+    bound = await registry.get_or_create(
+        agent_id="a2",
+        user_id=1,
+        channel_type="dashboard",
+        channel_subject_id="1",
+    )
+    sk = ThreadRegistry.make_key(agent_id="a2", channel_type="dashboard", channel_subject_id="1")
+    derived = "thr_src~a2"
+    assert (
+        registry.ensure_thread(
+            thread_id=derived,
+            agent_id="a2",
+            user_id=1,
+            channel_type="dashboard",
+            session_key=sk,
+        )
+        == derived
+    )
+    assert (
+        registry.ensure_thread(
+            thread_id=derived,
+            agent_id="a2",
+            user_id=1,
+            channel_type="dashboard",
+            session_key=sk,
+        )
+        == derived
+    )
+    assert registry.get_bound_thread_id(sk) == bound
+    row = registry.get_thread(derived)
+    assert row is not None
+    assert row.agent_id == "a2"
+    ids = {t.thread_id for t in registry.list_threads(agent_id="a2", user_id=1)}
+    assert derived in ids
+    assert bound in ids

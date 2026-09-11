@@ -2,7 +2,7 @@ import { useCallback, useMemo } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { message as antMessage } from "@/utils/antdMessage";
 import { useTranslation } from "react-i18next";
-import { useAgent } from "../context/AgentContext";
+import { useAgent, selectEnabledExperts } from "../context/AgentContext";
 import { octopThreadsApi } from "../api/modules/octopThreads";
 import { apiErrorMessage } from "../utils/apiError";
 import MinimalAgentSessionNav from "../pages/Chat/components/MinimalAgentSessionNav";
@@ -35,6 +35,16 @@ export default function MinimalRecordsHost() {
   );
   const resolvedAgentId = pathAgentId ?? activeAgentId;
 
+  // Match the chat page sidebar: only "enabled" (running) experts show in
+  // the records pane. A disabled expert (including one stored in
+  // localStorage as the last-active) is hidden so the user only sees experts
+  // they can actually chat with right now. ``/experts`` itself still lists
+  // every expert so users can re-enable the stopped one there.
+  const enabledAgents = useMemo(
+    () => selectEnabledExperts(agents, resolvedAgentId, { pinActive: false }),
+    [agents, resolvedAgentId],
+  );
+
   const handleSelect = useCallback(
     (sessionId: string, agentId: string) => {
       setActiveAgent(agentId);
@@ -47,6 +57,14 @@ export default function MinimalRecordsHost() {
     (agentId: string) => {
       setActiveAgent(agentId);
       navigate(`/chat/${agentId}`);
+    },
+    [navigate, setActiveAgent],
+  );
+
+  const handleNewChat = useCallback(
+    (agentId: string) => {
+      setActiveAgent(agentId);
+      navigate(`/chat/${agentId}`, { state: { newChat: true } });
     },
     [navigate, setActiveAgent],
   );
@@ -108,12 +126,13 @@ export default function MinimalRecordsHost() {
 
   return (
     <MinimalAgentSessionNav
-      agents={agents}
+      agents={enabledAgents}
       activeId={pathThreadId}
       activeAgentId={resolvedAgentId}
       activeSessions={[]}
       onSelect={handleSelect}
       onAgentSelect={handleAgentSelect}
+      onNewChat={handleNewChat}
       onDeleteActive={(id) => void handleDeleteActive(id)}
       onRenameActive={handleRenameActive}
       onPinActive={handlePinActive}

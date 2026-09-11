@@ -69,7 +69,7 @@ routes until the wizard finishes.
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
 | `GET`    | `/users` | admin | `[{id, username, role, display_name, email, enabled, ...}]` |
-| `POST`   | `/users` | admin | body `{username, password, role, display_name?, email?}` → `201` |
+| `POST`   | `/users` | admin | body `{username, password, role, display_name?, email?, permissions?, workspace_root_dir?, token_quota?}` → `201` |
 | `GET`    | `/users/{id}` | admin | full user row |
 | `PATCH`  | `/users/{id}` | admin | body subset of `{role, display_name, email, enabled, locale}` |
 | `POST`   | `/users/{id}/reset-password` | admin | body `{new_password}` → `204` |
@@ -95,6 +95,17 @@ routes until the wizard finishes.
 | `PUT`    | `/agents/{id}/tool-settings` | owner | body `{disabled_builtin: string[], plugins?}` — persists denylist + plugin flags (hot-sync, no reload) |
 | `PATCH`  | `/agents/{id}/tool-settings/{tool_name}` | owner | body `{enabled, source, plugin_id?}` — toggle one tool (hot-sync) |
 
+## Skills and skill packages
+
+Skill copy operations create snapshots; they do not keep the source and
+destination synchronized after the request completes.
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| `GET` | `/skill-packages?writable_only=true` | user (`skill_packages`) | List only packages the current user may modify; admins may modify all packages |
+| `POST` | `/agents/{id}/skill-packages/{package_id}/copy` | owner (`skill_packages`) | body `{skill_slugs: string[], overwrite?: boolean}`; copy selected package skills into the workspace |
+| `POST` | `/agents/{id}/skills/{slug}/push-to-package` | owner (`skill_packages`) | body `{package_id, overwrite?: boolean}`; copy a workspace skill into a package created by the user (or any package for admins) |
+
 ## Chat (WebSocket)
 
 | Path | Auth | Notes |
@@ -118,6 +129,16 @@ because each request is a one-shot continuation.
 | `PATCH`  | `/agents/{id}/chat/sessions/{thread_id}` | owner | body `{title?, pinned?}` → updated row |
 | `DELETE` | `/agents/{id}/chat/sessions/{thread_id}` | owner | `204` (archives the active row) |
 | `GET`    | `/agents/{id}/chat/sessions/{thread_id}/history` | owner | paginated message history; `turn_active` tells a reconnecting client whether to re-`subscribe` over the chat WebSocket |
+
+### Trajectory ledger
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| `GET` | `/agents/{id}/threads/{thread_id}/trajectory` | owner | paginated event summaries; use `before_seq` for older rows |
+| `GET` | `/agents/{id}/threads/{thread_id}/trajectory/events/{event_id}` | owner | full event payload |
+| `GET` | `/agents/{id}/threads/{thread_id}/trajectory/metrics` | owner | aggregated turn, timing, and token metrics |
+| `GET` | `/agents/{id}/threads/{thread_id}/trajectory/stream` | owner | live SSE events; resume with `after_seq` or `Last-Event-ID` |
+| `GET` | `/agents/{id}/threads/{thread_id}/trajectory/export` | owner | full ledger download as JSONL (default) or JSON |
 
 ## Channels
 
@@ -143,19 +164,20 @@ because each request is a one-shot continuation.
 | `GET`    | `/settings/timezone` | user | process-level `{timezone}` from `default_timezone` |
 | `GET`    | `/settings/upload` | user | `{max_upload_mb, max_upload_bytes}` from `max_upload_mb` |
 | `GET`    | `/cron/settings` | user | compat alias of `/settings/timezone` |
-| `GET`    | `/agents/{aid}/cron` | owner | list of cron rows |
-| `POST`   | `/agents/{aid}/cron` | owner | body `{trigger, prompt, session_key?, fresh_thread?, model?, task_type?}` → `201` |
-| `GET`    | `/agents/{aid}/cron/{cid}` | owner | cron row |
-| `PATCH`  | `/agents/{aid}/cron/{cid}` | owner | body subset → updated row |
-| `DELETE` | `/agents/{aid}/cron/{cid}` | owner | `204` |
-| `POST`   | `/agents/{aid}/cron/{cid}/run-now` | owner | `204` (fire immediately, off-schedule) |
+| `GET`    | `/agents/{aid}/cron` | owner only | list cron rows; non-owners (including admin) get `[]` |
+| `POST`   | `/agents/{aid}/cron` | owner only | body `{name?, trigger, prompt, session_key?, fresh_thread?, enabled?, model?, task_type?}` → `201` |
+| `GET`    | `/agents/{aid}/cron/{cid}` | owner only | cron row |
+| `PATCH`  | `/agents/{aid}/cron/{cid}` | owner only | body subset → updated row |
+| `DELETE` | `/agents/{aid}/cron/{cid}` | owner only | `204` |
+| `POST`   | `/agents/{aid}/cron/{cid}/run-now` | owner only | `204` (fire immediately, off-schedule) |
 
 `task_type` is `"text"` (push prompt directly to the session) or
 `"agent"` (run the prompt through the LLM and push the reply).
 Default: `"agent"`. `trigger` accepts cron expressions
 (`"0 9 * * *"`) plus the `interval:N` / `date:ISO8601` aliases
 documented in `infra/cron/trigger.py`. `prompt` must be non-empty and
-≤ 2000 characters.
+≤ 2000 characters. `name` is an optional display label; when omitted,
+the server derives one from `prompt`.
 
 ## Providers
 
@@ -314,9 +336,18 @@ for non-`/` paths.
 | `GET`    | `/connectors/auth/{kind}/info` | user | auth flow info |
 | `GET`    | `/connectors/auth/{kind}/authorize-url` | user | build the authorize URL |
 | `POST`   | `/connectors/auth/{kind}/exchange-code` | user | exchange auth code |
-| `POST`   | `/connectors/oauth/{kind}/start` | user | start an OAuth flow |
+| `POST`   | `/connectors/oauth/start` | user | start OAuth (catalog or custom MCP via `target`) |
+| `POST`   | `/connectors/oauth/{kind}/start` | user | legacy catalog OAuth start |
+| `PUT`    | `/connectors/custom-mcp` | user | save custom MCP server map |
+| `PATCH`  | `/connectors/custom-mcp/servers/{name}` | user | patch `enabled` / `default_open` on one server |
+| `POST`   | `/connectors/custom-mcp/test` | user | probe a custom MCP server (inline spec or saved name) |
 | `GET`    | `/connectors/oauth/callback` | public | OAuth redirect target |
 | `GET`    | `/connectors/oauth/pending/{state_id}` | user | poll the OAuth result |
+
+Custom MCP OAuth (streamable HTTP, public HTTPS URL only): Octop discovers the authorization
+server from the MCP URL (401 / RFC 9728 protected-resource metadata), requires dynamic client
+registration (DCR), stores encrypted tokens in the custom MCP spec, and injects `Authorization:
+Bearer` when loading tools. Loopback MCP URLs do not use remote OAuth discovery.
 
 ## Internal MCP (harness agents)
 
@@ -354,7 +385,8 @@ endpoint (public, mounted directly in `api/app.py`).
 |--------|------|------|-------|
 | `WS`/`POST`/`GET`/… | `/agents/{aid}/terminal` | owner | AI-assisted remote PTY |
 | `GET` | `/agents/{aid}/terminal/context` | owner | recent terminal context for the AI helper |
-| `WS`/`POST`/`GET`/… | `/browser/...` | user | remote Playwright sessions, screenshots, live streams |
+| `WS`/`POST`/`GET`/… | `/browser/...` | user | harness-browser sessions, live stream, record/replay |
+| `POST` | `/browser/shutdown` | user | stop the current user's Octop-managed Chrome |
 | `POST` | `/agents/{aid}/upload` | user | multipart upload → `{workspace}/inbound/` |
 | `POST` | `/agents/{aid}/files/access-urls` | user | refresh inbound media URLs (signed) |
 | `GET`  | `/agents/{aid}/files/{path}` | owner | read an inbound file |

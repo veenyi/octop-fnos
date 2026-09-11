@@ -18,19 +18,43 @@ from octop.infra.knowledge.files import (
 )
 from octop.infra.knowledge.gate import assert_knowledge_usable
 from octop.infra.knowledge.index import KnowledgeIndex
+from octop.infra.knowledge.ocr import (
+    OCR_IMAGE_SUFFIXES,
+    load_ocr_config,
+    optional_ocr_extractor,
+)
 from octop.infra.knowledge.parse import parse_document
 from octop.infra.knowledge.relpath import normalize_kb_path, path_basename, path_parent
 
 MAX_DOCS_PER_KB = 100
 MAX_BASES_PER_OWNER = 20
 MAX_DOCUMENT_BYTES = upload_mb_to_bytes(DEFAULT_MAX_UPLOAD_MB)
+# Upper bound for the per-base max_documents field. Mirrors Field(le=10000).
+MAX_KB_MAX_DOCUMENTS = 10_000
 _MAX_PREVIEW_CHARS = 200_000
 _EXT_TO_CONTENT_TYPE = {
     ".txt": "text/plain",
     ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".rst": "text/x-rst",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".json": "application/json",
+    ".jsonl": "application/jsonl",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
 }
 _ALLOWED_CONTENT_TYPES = set(_EXT_TO_CONTENT_TYPE.values())
 _TEXT_CONTENT_TYPES = {"text/plain", "text/markdown"}
@@ -39,11 +63,15 @@ _TEXT_FORMAT_TO_CONTENT_TYPE = {"md": "text/markdown", "txt": "text/plain"}
 
 
 def _resolve_content_type(filename: str, content_type: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    mapped = _EXT_TO_CONTENT_TYPE.get(suffix)
+    if mapped is not None:
+        return mapped
     ct = (content_type or "").strip().lower()
     if ct in _ALLOWED_CONTENT_TYPES:
         return ct
     if ct in {"", "application/octet-stream"}:
-        return _EXT_TO_CONTENT_TYPE.get(Path(filename).suffix.lower(), ct)
+        return ct
     return ct
 
 
@@ -73,10 +101,13 @@ class KnowledgeService:
         default_open: bool = False,
         shared: bool = False,
         icon_name: str = "",
+        max_documents: int = MAX_DOCS_PER_KB,
     ) -> KnowledgeBaseRow:
         assert_knowledge_usable(
             self._services.settings_repo.get, getattr(self._services, "provider_repo", None)
         )
+        if max_documents < 0 or max_documents > MAX_KB_MAX_DOCUMENTS:
+            raise ValueError(f"max_documents must be between 0 and {MAX_KB_MAX_DOCUMENTS}")
         owned = self._repo.count_bases_for_owner(owner_user_id)
         if owned >= MAX_BASES_PER_OWNER:
             raise ValueError(f"a user can own at most {MAX_BASES_PER_OWNER} knowledge bases")
@@ -91,6 +122,7 @@ class KnowledgeService:
                 shared=shared,
                 icon_name=icon_name,
                 embedding_model=model,
+                max_documents=max_documents,
             ),
         )
 
@@ -111,9 +143,14 @@ class KnowledgeService:
         default_open: bool | None = None,
         shared: bool | None = None,
         icon_name: str | None = None,
+        max_documents: int | None = None,
         is_admin: bool = False,
     ) -> KnowledgeBaseRow:
         self.require_owner(kb_id, actor_user_id=actor_user_id, is_admin=is_admin)
+        if max_documents is not None and (
+            max_documents < 0 or max_documents > MAX_KB_MAX_DOCUMENTS
+        ):
+            raise ValueError(f"max_documents must be between 0 and {MAX_KB_MAX_DOCUMENTS}")
         self._repo.update_base(
             kb_id,
             name=name,
@@ -121,6 +158,7 @@ class KnowledgeService:
             default_open=default_open,
             shared=shared,
             icon_name=icon_name,
+            max_documents=max_documents,
         )
         return self._require_base(kb_id)
 
@@ -148,7 +186,8 @@ class KnowledgeService:
             raise LookupError("knowledge document not found")
         if document.is_dir:
             raise LookupError("knowledge document not found")
-        text = parse_document(document_path(kb_id, doc_id, document.filename))
+        path = document_path(kb_id, doc_id, document.filename)
+        text = parse_document(path, ocr=optional_ocr_extractor(self._services))
         if len(text) > _MAX_PREVIEW_CHARS:
             text = text[:_MAX_PREVIEW_CHARS]
         return {
@@ -156,6 +195,31 @@ class KnowledgeService:
             "filename": document.filename,
             "text": text,
         }
+
+    def resolve_document_file(
+        self, kb_id: str, doc_id: str, *, actor_user_id: int, is_admin: bool = False
+    ) -> tuple[Path, str, str]:
+        """Return ``(path, filename, content_type)`` for the on-disk original.
+
+        Raises ``LookupError`` when the document row is missing and
+        ``FileNotFoundError`` when the original bytes are gone from disk.
+        """
+        self.get_readable_base(kb_id, actor_user_id=actor_user_id, is_admin=is_admin)
+        document = self._repo.get_document(doc_id)
+        if document is None or document.kb_id != kb_id:
+            raise LookupError("knowledge document not found")
+        if document.is_dir:
+            raise LookupError("knowledge document not found")
+        path = document_path(kb_id, doc_id, document.filename)
+        if not path.is_file():
+            raise FileNotFoundError("knowledge document original file not found")
+        return path, document.filename, document.content_type
+
+    def document_has_original(self, document: KnowledgeDocumentRow) -> bool:
+        """True when the uploaded original still exists on disk."""
+        if document.is_dir:
+            return False
+        return document_path(document.kb_id, document.id, document.filename).is_file()
 
     def read_text_document(
         self, kb_id: str, doc_id: str, *, actor_user_id: int, is_admin: bool = False
@@ -294,7 +358,7 @@ class KnowledgeService:
         assert_knowledge_usable(
             self._services.settings_repo.get, getattr(self._services, "provider_repo", None)
         )
-        self.get_writable_base(kb_id, actor_user_id=actor_user_id, is_admin=is_admin)
+        base = self.get_writable_base(kb_id, actor_user_id=actor_user_id, is_admin=is_admin)
         limit = self._max_document_bytes()
         if len(content) > limit:
             raise ValueError(f"knowledge document size exceeds maximum of {limit} bytes")
@@ -302,16 +366,22 @@ class KnowledgeService:
         name = path_basename(rel)
         if not name:
             raise ValueError("invalid knowledge document filename")
+        if (
+            Path(name).suffix.lower() in OCR_IMAGE_SUFFIXES
+            and not load_ocr_config(self._services.settings_repo.get).enabled
+        ):
+            raise ValueError("knowledge OCR must be enabled for image documents")
         resolved_type = _resolve_content_type(name, content_type)
         if resolved_type not in _ALLOWED_CONTENT_TYPES:
             raise ValueError(f"unsupported knowledge document content type: {content_type}")
+        # The per-base limit lives on the KB row (schema v10). 0 = unlimited.
         document = self._repo.create_document(
             kb_id=kb_id,
             filename=name,
             path=rel,
             content_type=resolved_type,
             byte_size=len(content),
-            max_documents=MAX_DOCS_PER_KB,
+            max_documents=base.max_documents,
         )
         try:
             write_document(kb_id, document.id, name, content)

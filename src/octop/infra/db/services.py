@@ -23,8 +23,11 @@ from octop.infra.db.repos.sessions import SessionRepo
 from octop.infra.db.repos.settings import SettingsRepo
 from octop.infra.db.repos.skill_packages import SkillPackageRepo
 from octop.infra.db.repos.sso import SsoRepo
+from octop.infra.db.repos.thread_messages import ThreadMessageRepo
 from octop.infra.db.repos.threads import ThreadRepo
+from octop.infra.db.repos.trajectory_events import TrajectoryEventRepo
 from octop.infra.db.repos.usage import UsageRepo
+from octop.infra.db.repos.user_policies import UserPolicyRepo
 from octop.infra.db.repos.users import UserRepo
 from octop.infra.db.repos.voice_providers import VoiceProviderRepo
 from octop.infra.utils.paths import PathLayout
@@ -35,6 +38,7 @@ class RepoBundle:
     db: DatabasePool
 
     user_repo: UserRepo
+    user_policy_repo: UserPolicyRepo
     invite_repo: InviteRepo
     agent_repo: AgentRepo
     provider_repo: ProviderRepo
@@ -42,6 +46,8 @@ class RepoBundle:
     cron_repo: CronJobRepo
     session_repo: SessionRepo
     thread_repo: ThreadRepo
+    thread_message_repo: ThreadMessageRepo
+    trajectory_event_repo: TrajectoryEventRepo
     secret_repo: SecretRepo
     audit_repo: AuditRepo
     usage_repo: UsageRepo
@@ -61,6 +67,7 @@ class RepoBundle:
         return cls(
             db=db,
             user_repo=UserRepo(db),
+            user_policy_repo=UserPolicyRepo(db),
             invite_repo=InviteRepo(db),
             agent_repo=AgentRepo(db),
             provider_repo=ProviderRepo(db),
@@ -68,6 +75,8 @@ class RepoBundle:
             cron_repo=CronJobRepo(db),
             session_repo=SessionRepo(db),
             thread_repo=ThreadRepo(db),
+            thread_message_repo=ThreadMessageRepo(db),
+            trajectory_event_repo=TrajectoryEventRepo(db),
             secret_repo=SecretRepo(db),
             audit_repo=AuditRepo(db),
             usage_repo=UsageRepo(db),
@@ -99,6 +108,10 @@ class SharedServices:
         return self.repos.user_repo
 
     @property
+    def user_policy_repo(self) -> UserPolicyRepo:
+        return self.repos.user_policy_repo
+
+    @property
     def invite_repo(self) -> InviteRepo:
         return self.repos.invite_repo
 
@@ -125,6 +138,14 @@ class SharedServices:
     @property
     def thread_repo(self) -> ThreadRepo:
         return self.repos.thread_repo
+
+    @property
+    def thread_message_repo(self) -> ThreadMessageRepo:
+        return self.repos.thread_message_repo
+
+    @property
+    def trajectory_event_repo(self) -> TrajectoryEventRepo:
+        return self.repos.trajectory_event_repo
 
     @property
     def secret_repo(self) -> SecretRepo:

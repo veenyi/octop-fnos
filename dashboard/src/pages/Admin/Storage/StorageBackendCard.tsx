@@ -4,9 +4,8 @@
  * Shows type icon (from STORAGE_TYPE_DEFS), name, kind, bucket/region/key info,
  * enabled toggle, edit and delete actions.
  */
-import { useState } from "react";
-import { Button, Modal, Switch, Tooltip } from "antd";
-import { message } from "@/utils/antdMessage";
+import { useState, type CSSProperties } from "react";
+import { App, Button, Switch, Tooltip } from "antd";
 
 import {
   Pencil,
@@ -21,6 +20,7 @@ import { request } from "../../../api/request";
 import { apiErrorMessage, parseApiError } from "../../../utils/apiError";
 import {
   STORAGE_TYPE_DEFS,
+  storageKindGroup,
   type StorageBackendRow,
 } from "./useStorageBackends";
 import { StorageBackendDrawer } from "./StorageBackendModal";
@@ -39,6 +39,7 @@ export function StorageBackendCard({
   isNew,
 }: StorageBackendCardProps) {
   const { t } = useTranslation();
+  const { modal, message } = App.useApp();
   const [editOpen, setEditOpen] = useState(false);
   const [browseOpen, setBrowseOpen] = useState(false);
   const [toggling, setToggling] = useState(false);
@@ -48,6 +49,7 @@ export function StorageBackendCard({
   const typeDef = STORAGE_TYPE_DEFS.find((d) => d.kind === backend.kind);
   const accent = typeDef?.color ?? "#8c8c8c";
   const icon = typeDef?.icon ?? null;
+  const group = storageKindGroup(backend.kind);
 
   const handleToggle = async (next: boolean) => {
     setToggling(true);
@@ -58,9 +60,19 @@ export function StorageBackendCard({
       });
       await onSaved();
       // Enabling a Docker sandbox should kick off image pull immediately.
-      if (next && backend.kind === "docker") {
+      if (
+        next &&
+        (backend.kind === "docker" || backend.kind === "opensandbox")
+      ) {
         setTesting(true);
-        const hide = message.loading(t("storage.dockerPulling"), 0);
+        const hide = message.loading(
+          t(
+            backend.kind === "opensandbox"
+              ? "storage.opensandboxInstalling"
+              : "storage.dockerPulling",
+          ),
+          0,
+        );
         try {
           const result = await request<{
             ok: boolean;
@@ -96,7 +108,7 @@ export function StorageBackendCard({
   };
 
   const handleDelete = () => {
-    Modal.confirm({
+    modal.confirm({
       title: t("storage.deleteTitle"),
       content: t("storage.deleteConfirm", { name: backend.name }),
       okText: t("common.delete"),
@@ -137,7 +149,9 @@ export function StorageBackendCard({
     });
   };
 
-  const isConfigured = !!backend.access_key || !!backend.bucket;
+  const bucketField = typeDef?.fields.find((f) => f.key === "bucket");
+  const isConfigured =
+    !!backend.access_key || !!backend.bucket || !!backend.endpoint;
   const primaryInfo = backend.bucket ?? backend.endpoint ?? "—";
 
   const handleTest = async () => {
@@ -174,7 +188,12 @@ export function StorageBackendCard({
         className={`${styles.backendCard} ${
           isNew ? styles.backendCardNew : ""
         }`}
-        style={{ opacity: backend.enabled ? 1 : 0.65 }}
+        style={
+          {
+            opacity: backend.enabled ? 1 : 0.65,
+            "--catalog-accent": accent,
+          } as CSSProperties
+        }
       >
         {/* Header */}
         <div className={styles.backendCardHeader}>
@@ -187,7 +206,15 @@ export function StorageBackendCard({
           <div className={styles.backendCardTitle}>
             <div className={styles.backendCardName}>{backend.name}</div>
             <div className={styles.backendCardKind}>
-              {typeDef ? t(typeDef.nameKey) : backend.kind}
+              <span>{typeDef ? t(typeDef.nameKey) : backend.kind}</span>
+              {group ? (
+                <span
+                  className={styles.groupChip}
+                  style={{ color: accent, background: `${accent}18` }}
+                >
+                  {t(group.titleKey)}
+                </span>
+              ) : null}
             </div>
           </div>
           <div
@@ -212,7 +239,7 @@ export function StorageBackendCard({
         <div className={styles.backendCardInfo}>
           <div className={styles.infoRow}>
             <span className={styles.infoLabel}>
-              {t("storage.bucketLabel")}:
+              {t(bucketField?.labelKey ?? "storage.bucketLabel")}:
             </span>
             <span className={styles.infoValue}>
               {primaryInfo !== "—" ? (

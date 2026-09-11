@@ -8,9 +8,12 @@
  */
 import { useMemo, useState } from "react";
 import { Spin, Tabs } from "antd";
-import { HardDrive } from "lucide-react";
+import { HardDrive, LayoutGrid } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import PageShell from "../../../layouts/PageShell";
+import TabLabel from "../../../components/TabLabel";
+import { OctopEmptyMascot } from "../../../components/EmptyState";
+import StreamSetupGuide from "../../../components/StreamSetupGuide/StreamSetupGuide";
 import {
   useStorageBackends,
   STORAGE_TYPE_DEFS,
@@ -80,19 +83,33 @@ export default function AdminStoragePage() {
     }
     if (backends.length === 0) {
       return (
-        <div className={styles.emptyState}>
-          <HardDrive size={44} style={{ color: "var(--fn-text-tertiary)" }} />
-          <div className={styles.emptyTitle}>{t("storage.emptyMyStorage")}</div>
-          <div className={styles.emptyHint}>
-            {t("storage.emptyMyStorageHint")}
-          </div>
-          <button
-            className={styles.emptyAction}
-            onClick={() => setActiveTab("types")}
-          >
-            {t("storage.goToTypes")}
-          </button>
-        </div>
+        <StreamSetupGuide
+          wide
+          icon={
+            <OctopEmptyMascot size={120} className={styles.emptyGuideMascot} />
+          }
+          title={t("storage.emptyGuideTitle")}
+          description={t("storage.emptyGuideDesc")}
+          steps={[
+            {
+              label: t("storage.emptyGuideStepWhat"),
+              detail: t("storage.emptyGuideStepWhatDetail"),
+            },
+            {
+              label: t("storage.emptyGuideStepHow"),
+              detail: t("storage.emptyGuideStepHowDetail"),
+            },
+            {
+              label: t("storage.emptyGuideStepUse"),
+              detail: t("storage.emptyGuideStepUseDetail"),
+            },
+          ]}
+          primaryAction={{
+            label: t("storage.goToTypes"),
+            onClick: () => setActiveTab("types"),
+            icon: <LayoutGrid size={14} />,
+          }}
+        />
       );
     }
     return (
@@ -151,12 +168,18 @@ export default function AdminStoragePage() {
         items={[
           {
             key: "my",
-            label: t("storage.myStorage"),
+            label: (
+              <TabLabel icon={HardDrive}>{t("storage.myStorage")}</TabLabel>
+            ),
             children: myStorageContent,
           },
           {
             key: "types",
-            label: t("storage.supportedTypes"),
+            label: (
+              <TabLabel icon={LayoutGrid}>
+                {t("storage.supportedTypes")}
+              </TabLabel>
+            ),
             children: typesContent,
           },
         ]}

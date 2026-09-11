@@ -9,11 +9,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from octop.api.deps import current_user
 from octop.infra.errors import ErrorCode, OctopError
+from octop.infra.utils.browser_media import user_browser_profile
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +50,10 @@ async def _is_session_alive(sess: Any, *, timeout: float = 2.0) -> bool:
     ``Runtime.evaluate`` to confirm the CDP connection is still usable.
     """
     try:
+        client = sess._internal.client  # noqa: SLF001
+        send = getattr(client, "send_passive", client.send)
         await asyncio.wait_for(
-            sess._internal.client.send(  # noqa: SLF001
-                "Runtime.evaluate", {"expression": "1", "returnByValue": True}
-            ),
+            send("Runtime.evaluate", {"expression": "1", "returnByValue": True}),
             timeout=timeout,
         )
         return True
@@ -70,14 +71,12 @@ async def resolve_harness_session(
 ) -> Any | None:
     """Return a live :class:`harness_browser.BrowserSession` for ``profile_hint``.
 
-    Resolution order:
-      1. Exact profile name when present in the in-process registry
-      2. ``default`` when the hint is ``auto`` / empty / unknown
-      3. Any profile already registered (agent may have started Chrome)
-      4. Create (launch-or-attach) for the resolved profile name — only when
-         ``create=True`` (screencast / interactive clients). Listen-only
-         dashboard hooks pass ``create=False`` so a status WebSocket cannot
-         spawn Chrome just to watch for session updates.
+    *profile_hint* must be a concrete profile name (``user-<id>``). Empty /
+    ``auto`` never falls back to another user's session or to ``default``.
+
+    When ``create=True`` (screencast / interactive clients) a missing live
+    session is launched. Listen-only dashboard hooks pass ``create=False``
+    so a status WebSocket cannot spawn Chrome just to watch for updates.
 
     Cached entries are health-checked before reuse — a dead/stale session
     (e.g. browser crashed) is evicted and replaced with a freshly launched
@@ -96,32 +95,28 @@ async def resolve_harness_session(
         ) from exc
 
     hint = (profile_hint or "").strip()
-    candidates: list[str] = []
-    if hint and hint not in {"auto"}:
-        candidates.append(hint)
-    if "default" not in candidates:
-        candidates.append("default")
-    candidates.extend(k for k in _registry if k not in candidates)
+    if not hint or hint == "auto":
+        if not create:
+            return None
+        raise OctopError(ErrorCode.SLASH_BAD_ARGS, "browser profile is required")
 
-    for name in candidates:
-        cached = _registry.get(name)
-        if cached is None:
-            continue
+    cached = _registry.get(hint)
+    if cached is not None:
         if await _is_session_alive(cached):
             return cached
         logger.warning(
             "harness session %r is dead (stale CDP connection); discarding%s",
-            name,
+            hint,
             " and relaunching" if create else "",
         )
-        _registry.pop(name, None)
+        _registry.pop(hint, None)
         with contextlib.suppress(Exception):
             await cached.close()
 
     if not create:
         return None
 
-    profile = candidates[0] if candidates else "default"
+    profile = hint
     harness_settings = None
     if server is not None and agent_id:
         from octop.api.common.agent_workspace import (  # noqa: PLC0415
@@ -207,7 +202,9 @@ async def resolve_harness_session(
 
 async def harness_page_url(sess: Any) -> str:
     try:
-        info = await sess._internal.client.send(  # noqa: SLF001
+        client = sess._internal.client  # noqa: SLF001
+        send = getattr(client, "send_passive", client.send)
+        info = await send(
             "Runtime.evaluate",
             {
                 "expression": "location.href",
@@ -259,7 +256,7 @@ async def harness_list_tabs(sess: Any) -> list[dict[str, Any]]:
     return tabs
 
 
-async def harness_sessions_payload(conversation_id: str | None = None) -> dict[str, Any]:
+async def harness_sessions_payload(profile_name: str) -> dict[str, Any]:
     """Shape expected by the dashboard ``BrowserSessionsResponse`` type."""
     try:
         from harness_browser.tool_interface import _registry
@@ -269,7 +266,7 @@ async def harness_sessions_payload(conversation_id: str | None = None) -> dict[s
     now = int(time.time() * 1000)
     sessions: list[dict[str, Any]] = []
     for profile, sess in list(_registry.items()):
-        if conversation_id and profile not in {conversation_id, "default"}:
+        if profile != profile_name:
             continue
         url = await harness_page_url(sess)
         sessions.append(
@@ -293,19 +290,16 @@ async def harness_sessions_payload(conversation_id: str | None = None) -> dict[s
 
 
 @router.get("/browser/harness-sessions")
-async def list_harness_sessions(
-    conversation_id: str | None = Query(default=None),
-    _: Any = Depends(current_user),
-) -> dict[str, Any]:
-    """List live harness-browser profiles (agent ``browser_use`` sessions)."""
-    return await harness_sessions_payload(conversation_id)
+async def list_harness_sessions(user: Any = Depends(current_user)) -> dict[str, Any]:
+    """List the current user's live harness-browser profile."""
+    return await harness_sessions_payload(user_browser_profile(user.id))
 
 
 @router.post("/browser/sessions/{session_id}/handoff")
 async def handoff(
     session_id: str,
     body: HandoffBody,
-    _: Any = Depends(current_user),
+    user: Any = Depends(current_user),
 ) -> dict[str, Any]:
     """Switch control of a browser session between the agent and the user.
 
@@ -314,14 +308,17 @@ async def handoff(
     session and reflected in ``harness-sessions`` and the WS screencast so a
     takeover survives dashboard reloads and reconnects.
     """
+    profile = user_browser_profile(user.id)
+    if session_id not in {"", "auto"} and session_id != profile:
+        logger.debug("handoff path %r ignored; using %r", session_id, profile)
     target = body.target
     if target not in ("agent", "user"):
         raise OctopError(ErrorCode.SLASH_BAD_ARGS, "target must be 'agent' or 'user'")
-    _CONTROL_OWNERS[session_id] = target
+    _CONTROL_OWNERS[profile] = target
 
-    payload = await harness_sessions_payload(conversation_id=session_id)
+    payload = await harness_sessions_payload(profile)
     session = next(
-        (s for s in payload.get("sessions", []) if s["session_id"] == session_id),
+        (s for s in payload.get("sessions", []) if s["session_id"] == profile),
         None,
     )
     if session is None:
@@ -329,9 +326,9 @@ async def handoff(
         # still flip its local control-owner state.
         now = int(time.time() * 1000)
         session = {
-            "session_id": session_id,
-            "profile_name": session_id,
-            "conversation_id": session_id,
+            "session_id": profile,
+            "profile_name": profile,
+            "conversation_id": profile,
             "channel_source": "dashboard",
             "state": "idle",
             "control_owner": target,
@@ -340,3 +337,31 @@ async def handoff(
             "last_activity_at": now,
         }
     return {"ok": True, "session": session}
+
+
+@router.post(
+    "/browser/shutdown",
+    summary="Stop the local Chrome process for a harness-browser profile",
+)
+async def shutdown_browser(user: Any = Depends(current_user)) -> dict[str, Any]:
+    """Terminate the current user's Octop-managed Chrome. Cookies stay on disk."""
+    try:
+        from harness_browser.tool_interface import browser_tool
+    except ImportError as exc:
+        raise OctopError(
+            ErrorCode.INTERNAL_ERROR,
+            "harness-browser not installed",
+            status=503,
+        ) from exc
+
+    hint = user_browser_profile(user.id)
+
+    result = await browser_tool(action="close_session", profile=hint, kill=True)
+    _CONTROL_OWNERS.pop(hint, None)
+    if not result.success:
+        raise OctopError(
+            ErrorCode.INTERNAL_ERROR,
+            result.error or f"failed to stop browser profile {hint!r}",
+            status=503,
+        )
+    return {"ok": True, "profile": hint}

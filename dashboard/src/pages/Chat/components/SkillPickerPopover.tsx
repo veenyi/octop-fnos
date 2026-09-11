@@ -11,12 +11,24 @@ import styles from "../index.module.less";
 
 interface SkillPickerPopoverProps {
   skills: SkillSpec[];
-  selectedSkills: string[];
-  onSkillsChange: (names: string[]) => void;
+  onSelectSkill: (slug: string) => void;
   onNavigateAway?: () => void;
 }
 
-function skillAvatarLabel(skill: SkillSpec): string {
+function SkillAvatar({ skill }: { skill: SkillSpec }) {
+  const iconUrl = skill.iconUrl?.trim();
+  return (
+    <span className={styles.skillPickerAvatar}>
+      {iconUrl ? (
+        <img src={iconUrl} alt="" className={styles.skillPickerAvatarImg} />
+      ) : (
+        skillAvatarFallback(skill)
+      )}
+    </span>
+  );
+}
+
+function skillAvatarFallback(skill: SkillSpec): string {
   if (skill.emoji) return skill.emoji;
   const name = skill.name || skill.slug;
   return name.charAt(0).toUpperCase();
@@ -24,8 +36,7 @@ function skillAvatarLabel(skill: SkillSpec): string {
 
 export default function SkillPickerPopover({
   skills,
-  selectedSkills,
-  onSkillsChange,
+  onSelectSkill,
   onNavigateAway,
 }: SkillPickerPopoverProps) {
   const { t } = useTranslation();
@@ -63,38 +74,27 @@ export default function SkillPickerPopover({
         onNavigateAway?.();
         navigate("/personalization/skills");
       }}
-      renderItem={(skill) => {
-        const active = selectedSkills.includes(skill.slug);
-        return (
-          <button
-            key={skill.slug}
-            type="button"
-            className={`${styles.skillPickerItem} ${
-              active ? styles.skillPickerItemActive : ""
-            }`}
-            onClick={() => {
-              const next = active
-                ? selectedSkills.filter((n) => n !== skill.slug)
-                : [...selectedSkills, skill.slug];
-              onSkillsChange(next);
-            }}
-          >
-            <span className={styles.skillPickerAvatar}>
-              {skillAvatarLabel(skill)}
+      renderItem={(skill) => (
+        <button
+          key={skill.slug}
+          type="button"
+          className={styles.skillPickerItem}
+          onClick={() => {
+            onSelectSkill(skill.slug);
+            onNavigateAway?.();
+          }}
+        >
+          <SkillAvatar skill={skill} />
+          <span className={pickerStyles.itemText}>
+            <span className={pickerStyles.itemName}>
+              {skillDisplayName(skill)}
             </span>
-            <span className={pickerStyles.itemText}>
-              <span className={pickerStyles.itemName}>
-                {skillDisplayName(skill)}
-              </span>
-              {skill.description ? (
-                <span className={pickerStyles.itemDesc}>
-                  {skill.description}
-                </span>
-              ) : null}
-            </span>
-          </button>
-        );
-      }}
+            {skill.description ? (
+              <span className={pickerStyles.itemDesc}>{skill.description}</span>
+            ) : null}
+          </span>
+        </button>
+      )}
     />
   );
 }

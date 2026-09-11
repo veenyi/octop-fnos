@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urlparse
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_UPLOAD_MB = 100
 MIN_MAX_UPLOAD_MB = 1
 MAX_MAX_UPLOAD_MB = 1024
+DEFAULT_BROWSER_IDLE_TIMEOUT_MINUTES = 30
 
 _VALID_DRIVERS = frozenset({"sqlite", "postgresql"})
 
@@ -94,6 +95,12 @@ class BackupConfig:
     auto_enabled: bool = False
     schedule: str = "cron:0 4 * * *"
     retention_count: int = 7
+    include_config: bool = True
+    include_workspaces: bool = True
+    include_skill_packages: bool = True
+    include_plugins: bool = True
+    include_knowledge: bool = True
+    include_chats: bool = False
 
 
 _VALID_MOBILE_BACKENDS = frozenset({"physical", "redroid", "emulator", "none"})
@@ -126,6 +133,7 @@ class OctopConfig:
     default_timezone: str = "Asia/Shanghai"
     enable_dashboard: bool = True
     enable_api_docs: bool = False
+    history_v2_enabled: bool = False
     require_setup_password: bool = True
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     # False when config.json omits ``database`` (use PathLayout.db unless env overrides).
@@ -134,6 +142,7 @@ class OctopConfig:
     backup: BackupConfig = field(default_factory=BackupConfig)
     capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
     max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
+    browser_idle_timeout_minutes: int = DEFAULT_BROWSER_IDLE_TIMEOUT_MINUTES
 
     @property
     def max_upload_bytes(self) -> int:
@@ -217,6 +226,14 @@ def _parse_backup_section(raw: object) -> BackupConfig:
         auto_enabled=bool(raw.get("auto_enabled", defaults.auto_enabled)),
         schedule=schedule,
         retention_count=retention,
+        include_config=bool(raw.get("include_config", defaults.include_config)),
+        include_workspaces=bool(raw.get("include_workspaces", defaults.include_workspaces)),
+        include_skill_packages=bool(
+            raw.get("include_skill_packages", defaults.include_skill_packages)
+        ),
+        include_plugins=bool(raw.get("include_plugins", defaults.include_plugins)),
+        include_knowledge=bool(raw.get("include_knowledge", defaults.include_knowledge)),
+        include_chats=bool(raw.get("include_chats", defaults.include_chats)),
     )
 
 
@@ -443,6 +460,17 @@ def load_config(path: Path) -> OctopConfig:
         merged["max_upload_mb"] = parse_max_upload_mb(
             merged.get("max_upload_mb", DEFAULT_MAX_UPLOAD_MB)
         )
+    if v := os.environ.get("OCTOP_BROWSER_IDLE_TIMEOUT_MINUTES"):
+        merged["browser_idle_timeout_minutes"] = _coerce_int(
+            "OCTOP_BROWSER_IDLE_TIMEOUT_MINUTES",
+            v,
+            int(
+                merged.get(
+                    "browser_idle_timeout_minutes",
+                    DEFAULT_BROWSER_IDLE_TIMEOUT_MINUTES,
+                )
+            ),
+        )
 
     capabilities = _parse_capabilities_section(raw.get("capabilities"))
     if v := os.environ.get("OCTOP_ENABLE_MOBILE"):
@@ -470,18 +498,13 @@ def load_config(path: Path) -> OctopConfig:
 
     backup = _parse_backup_section(raw.get("backup"))
     if v := os.environ.get("OCTOP_BACKUP_AUTO_ENABLED"):
-        backup = BackupConfig(
+        backup = replace(
+            backup,
             auto_enabled=_coerce_bool("OCTOP_BACKUP_AUTO_ENABLED", v, backup.auto_enabled),
-            schedule=backup.schedule,
-            retention_count=backup.retention_count,
         )
     if v := os.environ.get("OCTOP_BACKUP_SCHEDULE"):
         schedule = v.strip() or backup.schedule
-        backup = BackupConfig(
-            auto_enabled=backup.auto_enabled,
-            schedule=schedule,
-            retention_count=backup.retention_count,
-        )
+        backup = replace(backup, schedule=schedule)
     if v := os.environ.get("OCTOP_BACKUP_RETENTION_COUNT"):
         retention = _coerce_int("OCTOP_BACKUP_RETENTION_COUNT", v, backup.retention_count)
         if retention < 1:
@@ -490,10 +513,44 @@ def load_config(path: Path) -> OctopConfig:
                 backup.retention_count,
             )
             retention = backup.retention_count
-        backup = BackupConfig(
-            auto_enabled=backup.auto_enabled,
-            schedule=backup.schedule,
-            retention_count=retention,
+        backup = replace(backup, retention_count=retention)
+    if v := os.environ.get("OCTOP_BACKUP_INCLUDE_CONFIG"):
+        backup = replace(
+            backup,
+            include_config=_coerce_bool("OCTOP_BACKUP_INCLUDE_CONFIG", v, backup.include_config),
+        )
+    if v := os.environ.get("OCTOP_BACKUP_INCLUDE_WORKSPACES"):
+        backup = replace(
+            backup,
+            include_workspaces=_coerce_bool(
+                "OCTOP_BACKUP_INCLUDE_WORKSPACES", v, backup.include_workspaces
+            ),
+        )
+    if v := os.environ.get("OCTOP_BACKUP_INCLUDE_SKILL_PACKAGES"):
+        backup = replace(
+            backup,
+            include_skill_packages=_coerce_bool(
+                "OCTOP_BACKUP_INCLUDE_SKILL_PACKAGES",
+                v,
+                backup.include_skill_packages,
+            ),
+        )
+    if v := os.environ.get("OCTOP_BACKUP_INCLUDE_PLUGINS"):
+        backup = replace(
+            backup,
+            include_plugins=_coerce_bool("OCTOP_BACKUP_INCLUDE_PLUGINS", v, backup.include_plugins),
+        )
+    if v := os.environ.get("OCTOP_BACKUP_INCLUDE_KNOWLEDGE"):
+        backup = replace(
+            backup,
+            include_knowledge=_coerce_bool(
+                "OCTOP_BACKUP_INCLUDE_KNOWLEDGE", v, backup.include_knowledge
+            ),
+        )
+    if v := os.environ.get("OCTOP_BACKUP_INCLUDE_CHATS"):
+        backup = replace(
+            backup,
+            include_chats=_coerce_bool("OCTOP_BACKUP_INCLUDE_CHATS", v, backup.include_chats),
         )
 
     return OctopConfig(
@@ -507,6 +564,13 @@ def load_config(path: Path) -> OctopConfig:
         default_timezone=str(merged.get("default_timezone") or "Asia/Shanghai"),
         enable_dashboard=bool(merged["enable_dashboard"]),
         enable_api_docs=bool(merged["enable_api_docs"]),
+        history_v2_enabled=_coerce_bool(
+            "OCTOP_HISTORY_V2_ENABLED",
+            os.environ.get(
+                "OCTOP_HISTORY_V2_ENABLED", str(merged.get("history_v2_enabled", False))
+            ),
+            False,
+        ),
         require_setup_password=bool(merged["require_setup_password"]),
         database=parse_database_config(merged_db),
         database_in_file=database_in_file,
@@ -514,4 +578,13 @@ def load_config(path: Path) -> OctopConfig:
         backup=backup,
         capabilities=capabilities,
         max_upload_mb=int(merged.get("max_upload_mb", DEFAULT_MAX_UPLOAD_MB)),
+        browser_idle_timeout_minutes=max(
+            0,
+            int(
+                merged.get(
+                    "browser_idle_timeout_minutes",
+                    DEFAULT_BROWSER_IDLE_TIMEOUT_MINUTES,
+                )
+            ),
+        ),
     )

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { connectorsApi } from "../../../api/modules/connectors";
 import { providerApi } from "../../../api/modules/provider";
 import { preferencesApi } from "../../../api/modules/preferences";
@@ -9,23 +9,25 @@ import {
   type KnowledgeBase,
 } from "../../../api/modules/knowledgeBases";
 import type { ResolvedModel } from "../../../api/types";
-import type { SkillSpec } from "../../Agent/Skills/useSkills";
 import { CONNECTORS_CHANGED_EVENT } from "../../Agent/Connectors/customMcpUtils";
 import { useCurrentUser } from "../../../hooks/useCurrentUser";
+import { useAgent } from "../../../context/AgentContext";
 import { activeModelToRef } from "./useChatContextWindow";
 import {
   hasSavedConnectors,
   loadSavedConnectors,
-  loadSavedSkills,
   saveConnectors,
-  saveSkills,
 } from "../utils/chatStorage";
 import { resolveInitialConnectors } from "../utils/resolveInitialConnectors";
+import {
+  consumePendingAttachKnowledgeBaseId,
+  peekPendingAttachKnowledgeBaseId,
+} from "../utils/pendingAttachKnowledgeBase";
 import { withDefaultOpenKnowledgeBases } from "../utils/withDefaultOpenKnowledgeBases";
+import { isPendingThread } from "./useSessions";
 
 export function useChatComposerResources(
   resolvedAgentId: string | null | undefined,
-  chatSkills: SkillSpec[],
   activeThreadId?: string | null,
   stickyModel?: string | null,
   stickyReasoningMode?: "auto" | "enabled" | "disabled" | null,
@@ -33,8 +35,15 @@ export function useChatComposerResources(
 ) {
   const user = useCurrentUser();
   const currentUserId = user?.id ?? null;
+  const { agents } = useAgent();
+  const expert = agents.find((item) => item.agent_id === resolvedAgentId);
+  const expertMcpServers = expert?.mcp_servers;
+  const expertKnowledgeBaseIds = expert?.knowledge_base_ids;
+  const expertMcpKey = (expertMcpServers ?? []).join("\0");
+  const expertKbKey = (expertKnowledgeBaseIds ?? []).join("\0");
+  const isNewSession = !activeThreadId || isPendingThread(activeThreadId);
+  const composerTouchedRef = useRef(false);
   const [selectedConnectors, setSelectedConnectors] = useState<string[]>([]);
-  const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [selectedKnowledgeBaseIds, setSelectedKnowledgeBaseIds] = useState<
     string[]
   >([]);
@@ -73,6 +82,14 @@ export function useChatComposerResources(
       }
     >
   >({});
+
+  useEffect(() => {
+    composerTouchedRef.current = false;
+  }, [resolvedAgentId]);
+
+  useEffect(() => {
+    if (isNewSession) composerTouchedRef.current = false;
+  }, [isNewSession]);
 
   // Auto = omit turn model; backend applies the expert default.
   useEffect(() => {
@@ -133,15 +150,22 @@ export function useChatComposerResources(
           .filter((i) => i.status === "active" && i.has_credentials)
           .map((i) => ({
             mcp_server_name: i.mcp_server_name,
-            label: i.display_name,
+            label:
+              currentUserId !== null && i.owner_user_id !== currentUserId
+                ? `${i.display_name} · ${
+                    i.owner_display_name || i.owner_username || i.owner_user_id
+                  }`
+                : i.display_name,
             kind: i.kind,
-            default_open: i.default_open === true,
+            default_open:
+              i.default_open === true && i.owner_user_id === currentUserId,
           }));
         setChatConnectors(options);
         const allowed = new Set(options.map((o) => o.mcp_server_name));
-        const defaults = options
-          .filter((o) => o.default_open)
-          .map((o) => o.mcp_server_name);
+        const defaults = withDefaultOpenKnowledgeBases(
+          options.filter((o) => o.default_open).map((o) => o.mcp_server_name),
+          expertMcpServers ?? [],
+        );
         setSelectedConnectors((prev) =>
           resolveInitialConnectors({
             prev,
@@ -151,6 +175,9 @@ export function useChatComposerResources(
               : false,
             defaults,
             allowed,
+            ignorePrev: isNewSession && !composerTouchedRef.current,
+            ignoreSaved: isNewSession,
+            preferPrev: composerTouchedRef.current,
           }),
         );
       });
@@ -164,31 +191,23 @@ export function useChatComposerResources(
       window.removeEventListener("focus", onFocus);
       window.removeEventListener(CONNECTORS_CHANGED_EVENT, loadConnectors);
     };
-  }, [resolvedAgentId]);
-
-  useEffect(() => {
-    if (!resolvedAgentId) {
-      setSelectedSkills([]);
-      return;
-    }
-    const allowed = new Set(
-      chatSkills.filter((s) => s.enabled).map((s) => s.slug),
-    );
-    setSelectedSkills((prev) => {
-      const saved = loadSavedSkills(resolvedAgentId);
-      const base = prev.length > 0 ? prev : saved;
-      return base.filter((n) => allowed.has(n));
-    });
-  }, [resolvedAgentId, chatSkills]);
+  }, [resolvedAgentId, currentUserId, isNewSession, expertMcpKey]);
 
   useEffect(() => {
     let cancelled = false;
-    setSelectedKnowledgeBaseIds([]);
+    const pendingId = peekPendingAttachKnowledgeBaseId();
+    if (isNewSession && !composerTouchedRef.current) {
+      setSelectedKnowledgeBaseIds(pendingId ? [pendingId] : []);
+    }
     setChatKnowledgeBases(undefined);
     void knowledgeBasesApi
       .getCapability()
       .then((capability) => {
-        if (cancelled || !capability.usable) return;
+        if (cancelled) return;
+        if (!capability.usable) {
+          if (pendingId) consumePendingAttachKnowledgeBaseId();
+          return;
+        }
         return knowledgeBasesApi.list().then((bases) => {
           if (cancelled) return;
           setChatKnowledgeBases(bases);
@@ -200,9 +219,35 @@ export function useChatComposerResources(
                 base.owner_user_id === currentUserId,
             )
             .map((base) => base.id);
-          setSelectedKnowledgeBaseIds((previous) =>
-            withDefaultOpenKnowledgeBases(previous, ownedDefaults),
+          const allowed = new Set(bases.map((base) => base.id));
+          const defaults = withDefaultOpenKnowledgeBases(
+            ownedDefaults,
+            (expertKnowledgeBaseIds ?? []).filter((id) => allowed.has(id)),
           );
+          setSelectedKnowledgeBaseIds((previous) => {
+            if (composerTouchedRef.current) {
+              return pendingId &&
+                allowed.has(pendingId) &&
+                !previous.includes(pendingId)
+                ? [...previous, pendingId]
+                : previous;
+            }
+            if (isNewSession) {
+              return withDefaultOpenKnowledgeBases(
+                pendingId && allowed.has(pendingId) ? [pendingId] : [],
+                defaults,
+              );
+            }
+            return withDefaultOpenKnowledgeBases(
+              pendingId &&
+                allowed.has(pendingId) &&
+                !previous.includes(pendingId)
+                ? [...previous, pendingId]
+                : previous,
+              ownedDefaults,
+            );
+          });
+          if (pendingId) consumePendingAttachKnowledgeBaseId();
         });
       })
       .catch(() => {
@@ -211,7 +256,7 @@ export function useChatComposerResources(
     return () => {
       cancelled = true;
     };
-  }, [resolvedAgentId, currentUserId]);
+  }, [resolvedAgentId, currentUserId, isNewSession, expertKbKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -273,21 +318,15 @@ export function useChatComposerResources(
 
   const handleConnectorsChange = useCallback(
     (names: string[]) => {
+      composerTouchedRef.current = true;
       setSelectedConnectors(names);
       if (resolvedAgentId) saveConnectors(resolvedAgentId, names);
     },
     [resolvedAgentId],
   );
 
-  const handleSkillsChange = useCallback(
-    (names: string[]) => {
-      setSelectedSkills(names);
-      if (resolvedAgentId) saveSkills(resolvedAgentId, names);
-    },
-    [resolvedAgentId],
-  );
-
   const handleKnowledgeBaseIdsChange = useCallback((ids: string[]) => {
+    composerTouchedRef.current = true;
     setSelectedKnowledgeBaseIds(ids);
   }, []);
 
@@ -312,7 +351,11 @@ export function useChatComposerResources(
           },
         }));
       }
-      if (resolvedAgentId && activeThreadId) {
+      if (
+        resolvedAgentId &&
+        activeThreadId &&
+        !isPendingThread(activeThreadId)
+      ) {
         void octopThreadsApi.patch(resolvedAgentId, activeThreadId, {
           model_ref: model,
           reasoning_mode: nextMode,
@@ -337,7 +380,11 @@ export function useChatComposerResources(
           },
         }));
       }
-      if (resolvedAgentId && activeThreadId) {
+      if (
+        resolvedAgentId &&
+        activeThreadId &&
+        !isPendingThread(activeThreadId)
+      ) {
         void octopThreadsApi.patch(resolvedAgentId, activeThreadId, {
           reasoning_mode: mode,
           reasoning_effort: effort,
@@ -354,14 +401,12 @@ export function useChatComposerResources(
     reasoningEffort,
     handleReasoningChange,
     selectedConnectors,
-    selectedSkills,
     selectedKnowledgeBaseIds,
     chatConnectors,
     chatKnowledgeBases,
     availableModels,
     activeModelRef,
     handleConnectorsChange,
-    handleSkillsChange,
     handleKnowledgeBaseIdsChange,
   };
 }

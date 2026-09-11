@@ -676,63 +676,62 @@ export function convertHistoryMessages(
 async function loadThreadHistory(
   agentId: string,
   threadId: string,
-  params: { limit?: number; offset?: number } = {},
+  params: { limit?: number; offset?: number; cursor?: string | null } = {},
 ): Promise<{
   messages: ChatMessage[];
   hasMore: boolean;
   nextOffset: number;
+  nextCursor: string | null;
   turnActive: boolean;
   artifacts: string[];
+  projectionLoading: boolean;
+  retryAfterMs: number;
 }> {
-  try {
-    const { octopThreadsApi, CHAT_HISTORY_PAGE_SIZE } = await import(
-      "../../../api/modules/octopThreads"
-    );
-    const { syncSessionArtifacts } = await import("./useSessions");
-    const limit = params.limit ?? CHAT_HISTORY_PAGE_SIZE;
-    const offset = params.offset ?? 0;
-    const history = await octopThreadsApi.history(agentId, threadId, {
-      limit,
-      offset,
-    });
-    const artifacts = Array.isArray(history.artifacts)
-      ? history.artifacts.filter(
-          (path): path is string =>
-            typeof path === "string" && path.trim().length > 0,
-        )
-      : [];
-    if (offset === 0) {
-      syncSessionArtifacts(threadId, artifacts);
-    }
-    const messages = injectPendingHitlMessage(
-      convertHistoryMessages(
-        history.messages.filter(
-          (message) =>
-            message.role === "user" ||
-            message.role === "assistant" ||
-            message.role === "tool",
-        ),
-        agentId,
-      ),
-      history.hitl_pending,
-    );
-    return {
-      messages,
-      hasMore: Boolean(history.has_more),
-      nextOffset: offset + limit,
-      turnActive: Boolean(history.turn_active),
-      artifacts,
-    };
-  } catch (err) {
-    console.error("loadThreadHistory failed", err);
-    return {
-      messages: [],
-      hasMore: false,
-      nextOffset: 0,
-      turnActive: false,
-      artifacts: [],
-    };
+  const { octopThreadsApi, CHAT_HISTORY_PAGE_SIZE } = await import(
+    "../../../api/modules/octopThreads"
+  );
+  const { syncSessionArtifacts } = await import("./useSessions");
+  const limit = params.limit ?? CHAT_HISTORY_PAGE_SIZE;
+  const offset = params.offset ?? 0;
+  const history = await octopThreadsApi.history(agentId, threadId, {
+    limit,
+    offset,
+    cursor: params.cursor,
+  });
+  const artifacts = Array.isArray(history.artifacts)
+    ? history.artifacts.filter(
+        (path): path is string =>
+          typeof path === "string" && path.trim().length > 0,
+      )
+    : [];
+  if (offset === 0) {
+    syncSessionArtifacts(threadId, artifacts);
   }
+  const messages = injectPendingHitlMessage(
+    convertHistoryMessages(
+      history.messages.filter(
+        (message) =>
+          message.role === "user" ||
+          message.role === "assistant" ||
+          message.role === "tool",
+      ),
+      agentId,
+    ),
+    history.hitl_pending,
+  );
+  return {
+    messages,
+    hasMore: Boolean(history.has_more),
+    nextOffset: offset + limit,
+    nextCursor: history.next_cursor ?? null,
+    turnActive: Boolean(history.turn_active),
+    artifacts,
+    projectionLoading: Boolean(history.history_loading),
+    retryAfterMs:
+      typeof history.history_retry_after_ms === "number"
+        ? history.history_retry_after_ms
+        : 1500,
+  };
 }
 
 // ── The hook ──────────────────────────────────────────────────────────────
@@ -747,6 +746,13 @@ export function useChat(
   agentId: string | null = null,
 ) {
   const stableSessionId = sessionId || "__empty__";
+  const [historyError, setHistoryError] = useState(false);
+  const failedHistoryOperation = useRef<"initial" | "older" | "latest">(
+    "initial",
+  );
+  useEffect(() => {
+    setHistoryError(false);
+  }, [stableSessionId]);
 
   // Resume reconnect only for the thread the user is looking at.
   useEffect(() => {
@@ -807,7 +813,6 @@ export function useChat(
       modelRef?: string | null,
       mcpServers?: string[] | null,
       knowledgeBaseIds?: string[] | null,
-      skills?: string[] | null,
       targetAgentIds?: string[] | null,
       composerContext?: UserComposerContext,
       reasoningMode?: "auto" | "enabled" | "disabled",
@@ -841,7 +846,6 @@ export function useChat(
         threadIdForApi,
         mcpServers,
         knowledgeBaseIds,
-        skills,
         targetAgentIds,
         reasoningMode,
         reasoningEffort,
@@ -865,7 +869,15 @@ export function useChat(
       }
 
       // Already have local history: only re-probe when we still expect a stream.
-      if (snap.messages.length > 0 || snap.historyHydrated) {
+      // A server push (cron, IM) marks history stale and forces a refetch.
+      // An empty cached page is never trusted: a background turn (cron, IM,
+      // another tab) may have written the first messages since we hydrated,
+      // and nothing would refetch them before a page reload.
+      const liveTurn = snap.isStreaming || chatStore.hasLiveSocket(key);
+      if (
+        (snap.messages.length > 0 || liveTurn) &&
+        !chatStore.isHistoryStale(key)
+      ) {
         if (shouldProbeActiveTurn({ isStreaming: snap.isStreaming })) {
           attachAfterHistory(key, targetThreadId);
         }
@@ -879,19 +891,40 @@ export function useChat(
       setHistoryLoading(true);
 
       try {
-        const {
-          messages: converted,
-          hasMore,
-          nextOffset,
-          turnActive,
-        } = await loadThreadHistory(agentId, targetThreadId, { offset: 0 });
-        if (loadGenRef.current !== gen) return;
-        chatStore.setHistoryPage(key, converted, {
-          hasMore,
-          nextOffset,
+        let loaded = await loadThreadHistory(agentId, targetThreadId, {
+          offset: 0,
         });
-        if (shouldProbeActiveTurn({ isStreaming: false, turnActive })) {
+        while (loaded.projectionLoading && loadGenRef.current === gen) {
+          await new Promise((resolve) =>
+            window.setTimeout(
+              resolve,
+              Math.max(500, Math.min(loaded.retryAfterMs, 5000)),
+            ),
+          );
+          if (loadGenRef.current !== gen) return;
+          loaded = await loadThreadHistory(agentId, targetThreadId, {
+            offset: 0,
+          });
+        }
+        if (loadGenRef.current !== gen) return;
+        chatStore.setHistoryPage(key, loaded.messages, {
+          hasMore: loaded.hasMore,
+          nextOffset: loaded.nextOffset,
+          nextCursor: loaded.nextCursor,
+        });
+        setHistoryError(false);
+        if (
+          shouldProbeActiveTurn({
+            isStreaming: false,
+            turnActive: loaded.turnActive,
+          })
+        ) {
           attachAfterHistory(key, targetThreadId);
+        }
+      } catch {
+        if (loadGenRef.current === gen) {
+          failedHistoryOperation.current = "initial";
+          setHistoryError(true);
         }
       } finally {
         if (loadGenRef.current === gen) {
@@ -918,15 +951,31 @@ export function useChat(
     loadMoreInFlightRef.current = true;
     chatStore.setHistoryLoadingMore(key, true);
     const offset = snap.historyNextOffset;
+    const gen = loadGenRef.current;
 
     try {
       const {
         messages: older,
         hasMore,
         nextOffset,
-      } = await loadThreadHistory(agentId, stableSessionId, { offset });
-      chatStore.prependHistoryMessages(key, older, { hasMore, nextOffset });
+        nextCursor,
+      } = await loadThreadHistory(agentId, stableSessionId, {
+        offset,
+        cursor: snap.historyNextCursor,
+      });
+      chatStore.prependHistoryMessages(key, older, {
+        hasMore,
+        nextOffset,
+        nextCursor,
+      });
+      if (loadGenRef.current === gen) setHistoryError(false);
       return true;
+    } catch {
+      if (loadGenRef.current === gen) {
+        failedHistoryOperation.current = "older";
+        setHistoryError(true);
+      }
+      return false;
     } finally {
       loadMoreInFlightRef.current = false;
       chatStore.setHistoryLoadingMore(key, false);
@@ -939,54 +988,75 @@ export function useChat(
    * Used when the user overscrolls at the bottom to recover from a dropped WS
    * stream that left the last assistant turn incomplete in memory.
    */
-  const refreshHistory = useCallback(async () => {
-    const key = stableSessionId;
-    const snap = chatStore.getSnapshot(key);
-    if (
-      refreshInFlightRef.current ||
-      historyRefreshing ||
-      historyLoading ||
-      shouldBlockHistoryRefresh({
-        isStreaming: snap.isStreaming,
-        hasLiveSocket: chatStore.hasLiveSocket(key),
-      }) ||
-      !agentId ||
-      key === "__empty__"
-    ) {
-      return;
-    }
+  const refreshHistory = useCallback(
+    async (targetSessionId?: string) => {
+      const key = targetSessionId || stableSessionId;
+      const snap = chatStore.getSnapshot(key);
+      if (
+        refreshInFlightRef.current ||
+        historyRefreshing ||
+        historyLoading ||
+        shouldBlockHistoryRefresh({
+          isStreaming: snap.isStreaming,
+          hasLiveSocket: chatStore.hasLiveSocket(key),
+        }) ||
+        !agentId ||
+        key === "__empty__"
+      ) {
+        return;
+      }
 
-    refreshInFlightRef.current = true;
-    // Separate from loadGenRef: loadHistory may bump loadGen while we fetch.
-    // Always clear the refreshing flag in finally so the footer cannot stick.
-    const gen = ++loadGenRef.current;
-    setHistoryRefreshing(true);
+      refreshInFlightRef.current = true;
+      // Separate from loadGenRef: loadHistory may bump loadGen while we fetch.
+      // Always clear the refreshing flag in finally so the footer cannot stick.
+      const gen = ++loadGenRef.current;
+      setHistoryRefreshing(true);
 
-    try {
-      const {
-        messages: latest,
-        hasMore,
-        nextOffset,
-      } = await loadThreadHistory(agentId, key, { offset: 0 });
-      // Stale after a concurrent loadHistory / newer refresh — drop apply only.
-      if (loadGenRef.current !== gen) return;
+      try {
+        const {
+          messages: latest,
+          hasMore,
+          nextOffset,
+          nextCursor,
+        } = await loadThreadHistory(agentId, key, { offset: 0 });
+        // Stale after a concurrent loadHistory / newer refresh — drop apply only.
+        if (loadGenRef.current !== gen) return;
 
-      // Keep older pages the user already scrolled in; replace the overlapping
-      // latest-page window with the server copy so truncated WS turns heal.
-      const latestIds = new Set(latest.map((m) => m.id));
-      const firstOverlap = snap.messages.findIndex((m) => latestIds.has(m.id));
-      const olderPrefix =
-        firstOverlap > 0 ? snap.messages.slice(0, firstOverlap) : [];
-      chatStore.setHistoryPage(key, [...olderPrefix, ...latest], {
-        hasMore: olderPrefix.length > 0 ? snap.historyHasMore : hasMore,
-        nextOffset:
-          olderPrefix.length > 0 ? snap.historyNextOffset : nextOffset,
-      });
-    } finally {
-      refreshInFlightRef.current = false;
-      setHistoryRefreshing(false);
-    }
-  }, [agentId, stableSessionId, historyRefreshing, historyLoading]);
+        // Keep older pages the user already scrolled in; replace the overlapping
+        // latest-page window with the server copy so truncated WS turns heal.
+        const latestIds = new Set(latest.map((m) => m.id));
+        const firstOverlap = snap.messages.findIndex((m) =>
+          latestIds.has(m.id),
+        );
+        const olderPrefix =
+          firstOverlap > 0 ? snap.messages.slice(0, firstOverlap) : [];
+        chatStore.setHistoryPage(key, [...olderPrefix, ...latest], {
+          hasMore: olderPrefix.length > 0 ? snap.historyHasMore : hasMore,
+          nextOffset:
+            olderPrefix.length > 0 ? snap.historyNextOffset : nextOffset,
+          nextCursor:
+            olderPrefix.length > 0 ? snap.historyNextCursor : nextCursor,
+        });
+        setHistoryError(false);
+      } catch {
+        if (loadGenRef.current === gen) {
+          failedHistoryOperation.current = "latest";
+          setHistoryError(true);
+        }
+      } finally {
+        refreshInFlightRef.current = false;
+        setHistoryRefreshing(false);
+      }
+    },
+    [agentId, stableSessionId, historyRefreshing, historyLoading],
+  );
+
+  const retryHistory = useCallback(async () => {
+    if (failedHistoryOperation.current === "older") await loadMoreHistory();
+    else if (failedHistoryOperation.current === "latest")
+      await refreshHistory();
+    else await loadHistory(stableSessionId);
+  }, [loadMoreHistory, refreshHistory, loadHistory, stableSessionId]);
 
   /**
    * Edit a historical user message: truncate everything from that message
@@ -1030,15 +1100,25 @@ export function useChat(
     (
       decisions: Array<{ type: string; message?: string }>,
       storeKey?: string,
+      dismissed?: boolean,
     ) => {
       if (!agentId) return;
       const key = storeKey || stableSessionId;
       const threadId =
         storeKey || (stableSessionId !== "__empty__" ? stableSessionId : "");
       if (!threadId || threadId === "__empty__") return;
-      void chatStore.resumeHitl(key, agentId, threadId, decisions);
+      void chatStore.resumeHitl(
+        key,
+        agentId,
+        threadId,
+        decisions,
+        () => {
+          void refreshHistory(threadId);
+        },
+        dismissed,
+      );
     },
-    [agentId, stableSessionId],
+    [agentId, stableSessionId, refreshHistory],
   );
 
   return {
@@ -1048,6 +1128,7 @@ export function useChat(
     runUsage,
     contextUsage,
     historyLoading,
+    historyError,
     historyHasMore,
     historyLoadingMore,
     historyRefreshing,
@@ -1058,6 +1139,7 @@ export function useChat(
     loadHistory,
     loadMoreHistory,
     refreshHistory,
+    retryHistory,
     clearMessages,
     resumeHitl,
   };

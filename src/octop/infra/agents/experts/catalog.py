@@ -481,6 +481,9 @@ def build_create_spec_from_expert(
     color: str | None = None,
     welcome_message: str | None = None,
     published_expert_id: str | None = None,
+    skill_package_ids: list[str] | None = None,
+    knowledge_base_ids: list[str] | None = None,
+    mcp_servers: list[str] | None = None,
 ) -> AgentCreateSpec:
     """Build :class:`AgentCreateSpec` for ``AgentManager.create`` from a catalog entry."""
     resolved_name = resolve_expert_agent_name(expert, expert_id, locale=locale, override=name)
@@ -508,6 +511,8 @@ def build_create_spec_from_expert(
     extra.pop("published_expert_id", None)
     extra.pop("welcome_message", None)
     extra.pop("skill_package_ids", None)
+    extra.pop("knowledge_base_ids", None)
+    extra.pop("mcp_servers", None)
     return AgentCreateSpec(
         agent_id=agent_id,
         name=resolved_name,
@@ -521,6 +526,9 @@ def build_create_spec_from_expert(
         icon_name=icon_name or extra_icon_name or expert.summary.icon_name,
         icon_url=icon_url or extra_icon_url,
         color=color or extra_color or expert.summary.color,
+        skill_package_ids=skill_package_ids,
+        knowledge_base_ids=knowledge_base_ids,
+        mcp_servers=mcp_servers,
         published_expert_id=published_expert_id,
         welcome_message=welcome_message,
     )

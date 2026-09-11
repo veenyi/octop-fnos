@@ -13,7 +13,11 @@ from typing import Any, cast
 from psycopg import IntegrityError as PsycopgIntegrityError
 
 from octop.infra.agents.avatar import bind_workspace_avatar_icon_url
-from octop.infra.agents.experts.catalog import MANIFEST_FILENAME, seed_expert_directory
+from octop.infra.agents.experts.catalog import (
+    MANIFEST_FILENAME,
+    read_workspace_manifest_welcome,
+    seed_expert_directory,
+)
 from octop.infra.agents.experts.publish import (
     PublishedExpertSnapshotMeta,
     assert_can_mutate_published,
@@ -23,6 +27,7 @@ from octop.infra.agents.experts.publish import (
 from octop.infra.agents.manager import AgentCreateSpec
 from octop.infra.db.repos.published_experts import PublishedExpertRow
 from octop.infra.errors import ErrorCode, OctopError
+from octop.infra.trajectory.settings import apply_enable_trajectory
 from octop.infra.users.identity import User
 from octop.infra.utils.ulid import new_ulid
 
@@ -35,11 +40,14 @@ class PublishedExpertInstallOptions:
     default_model: str | None = None
     backend: dict[str, Any] | None = None
     skill_package_ids: list[str] | None = None
+    knowledge_base_ids: list[str] | None = None
+    mcp_servers: list[str] | None = None
     color: str | None = None
     agent_id: str | None = None
     icon_url: str | None = None
     welcome_message: str | None = None
     runtime_config: dict[str, Any] | None = None
+    enable_trajectory: bool = True
 
 
 def _snapshot_dir(services: Any, expert_id: str) -> Path:
@@ -79,6 +87,12 @@ def _manifest_quick_prompts(manifest: dict[str, Any]) -> tuple[dict[str, Any], .
         if isinstance(item, dict):
             out.append(item)
     return tuple(out)
+
+
+async def _workspace_quick_prompts(workspace: Any) -> tuple[dict[str, Any], ...]:
+    """Quick cards configured on the source agent, so publishing never drops them."""
+    payload = await read_workspace_manifest_welcome(workspace)
+    return _manifest_quick_prompts(payload) if payload is not None else ()
 
 
 def _agent_color(registry: Any, agent_id: str) -> str | None:
@@ -154,6 +168,7 @@ async def publish_agent_expert(
     expert_id = new_ulid()
     snapshot_dir = _snapshot_dir(services, expert_id)
     resolved_description = description or source.description or ""
+    resolved_quick_prompts = quick_prompts or await _workspace_quick_prompts(workspace)
     color = _agent_color(registry, source.agent_id) or ""
     icon_name = getattr(source, "icon_name", None) or source.icon or ""
     try:
@@ -167,7 +182,7 @@ async def publish_agent_expert(
                 color=color or None,
                 welcome_message_zh=welcome_message_zh,
                 welcome_message_en=welcome_message_en,
-                quick_prompts=quick_prompts,
+                quick_prompts=resolved_quick_prompts,
             ),
             manifest_id=resolved_slug,
         )
@@ -230,7 +245,9 @@ async def refresh_published_expert(
     resolved_welcome_en = (
         welcome_message_en if welcome_message_en is not None else existing_welcome_en
     )
-    resolved_quick_prompts = quick_prompts if quick_prompts is not None else existing_quick_prompts
+    resolved_quick_prompts = quick_prompts
+    if resolved_quick_prompts is None:
+        resolved_quick_prompts = await _workspace_quick_prompts(workspace) or existing_quick_prompts
     await export_agent_workspace_to_dir(
         workspace=workspace,
         dest=snapshot_dir,
@@ -273,7 +290,12 @@ async def install_published_expert(
     expert_id: str,
     options: PublishedExpertInstallOptions,
 ) -> dict[str, Any]:
-    """Create a private agent and seed it from the immutable published snapshot."""
+    """Create a private agent and seed it from the immutable published snapshot.
+
+    Composer defaults (knowledge bases / connectors) are installer-owned: the
+    snapshot does not copy them from the publisher's source agent. The installer
+    may pass their own lists on this request.
+    """
     row = require_published_expert(services, expert_id)
     snapshot_dir = _snapshot_dir(services, row.id)
     if not snapshot_dir.is_dir():
@@ -292,6 +314,11 @@ async def install_published_expert(
         config_extra["providers"] = list(options.providers)
     if options.backend:
         config_extra["backend"] = options.backend
+    apply_enable_trajectory(config_extra, options.enable_trajectory)
+
+    async def seed_snapshot(created_row: Any, workspace: Any) -> None:
+        await seed_expert_directory(expert_dir=snapshot_dir, workspace=workspace)
+        await bind_workspace_avatar_icon_url(registry, created_row.agent_id, workspace)
 
     created = await registry.create(
         AgentCreateSpec(
@@ -306,18 +333,15 @@ async def install_published_expert(
             icon_name=row.icon_name or None,
             icon_url=options.icon_url,
             color=options.color or row.color or None,
+            skill_package_ids=package_ids,
+            knowledge_base_ids=options.knowledge_base_ids,
+            mcp_servers=options.mcp_servers,
             published_expert_id=row.id,
             welcome_message=options.welcome_message,
-        )
+        ),
+        defer_bootstrap=True,
+        workspace_initializer=seed_snapshot,
     )
-    workspace = registry.workspace_for_agent(created.agent_id)
-    if workspace is None:
-        raise OctopError(ErrorCode.AGENT_NOT_FOUND, f"agent {created.agent_id!r} not found")
-    await seed_expert_directory(expert_dir=snapshot_dir, workspace=workspace)
-    await bind_workspace_avatar_icon_url(registry, created.agent_id, workspace)
-    if package_ids is not None:
-        await registry.persist_skill_package_ids(created.agent_id, package_ids)
-    await registry.reload(created.agent_id)
     return {
         "id": created.id,
         "agent_id": created.agent_id,

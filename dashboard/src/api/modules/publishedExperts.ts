@@ -9,6 +9,7 @@ export interface PublishedExpert {
   creator_username: string | null;
   source_agent_id: string | null;
   icon_name: string | null;
+  icon_url?: string | null;
   color: string | null;
   created_at: string;
   updated_at: string;
@@ -31,6 +32,8 @@ export interface InstallPublishedExpertBody {
   default_model?: string;
   backend?: Record<string, unknown>;
   skill_package_ids?: string[];
+  knowledge_base_ids?: string[];
+  mcp_servers?: string[];
   color?: string;
   welcome_message?: string;
   max_iters?: number | null;
@@ -38,13 +41,16 @@ export interface InstallPublishedExpertBody {
   temperature?: number | null;
   top_p?: number | null;
   max_tokens?: number | null;
+  enable_trajectory?: boolean;
 }
 
 export interface InstalledPublishedExpert {
   agent_id: string;
   name: string;
   description: string | null;
+  state: string;
   published_expert_id: string;
+  bootstrap_pending: boolean;
 }
 
 const publishedPath = (expertId: string) =>

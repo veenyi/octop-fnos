@@ -40,6 +40,15 @@
   gap: 16px;
 }
 
+.emptyGuideMascot {
+  display: block;
+  width: 120px;
+  height: 120px;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
 /* ── Type Card (service catalog) ───────────────────────────────── */
 
 .typeCard {
@@ -129,6 +138,26 @@
   min-height: 44px;
 }
 
+.typeCardTitleCol {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.categoryChip {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0 7px;
+  border-radius: 9px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
 .typeCardIconLarge {
   width: 44px;
   height: 44px;
@@ -154,16 +183,6 @@
   flex-shrink: 0;
 }
 
-.typeCardSwitch {
-  display: flex;
-  align-items: center;
-  flex-shrink: 0;
-}
-
-.typeCardSwitchLabel {
-  display: none;
-}
-
 .typeCardIcon {
   width: 40px;
   height: 40px;
@@ -187,6 +206,11 @@
   text-overflow: ellipsis;
 }
 
+.typeCardTitleCol .typeCardTitle {
+  flex: none;
+  width: 100%;
+}
+
 .typeCardDesc {
   font-size: 13px;
   color: var(--fn-text-tertiary);
@@ -208,67 +232,45 @@
 
 /* ── Instance Card (my connections) ────────────────────────────── */
 
-.instanceCard {
-  background: var(--fn-bg-primary);
-  border: 2px solid var(--fn-card-border-normal);
-  border-radius: var(--fn-radius-lg);
-  padding: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  transition:
-    border-color 0.2s,
-    box-shadow 0.2s;
-
-  &:hover {
-    border-color: color-mix(
-      in srgb,
-      var(--connector-accent, var(--fn-color-brand)) 40%,
-      var(--fn-card-border-normal)
-    );
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
-  }
-}
-
-.instanceCardMain {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-}
-
-.instanceCardIcon {
-  width: 40px;
-  height: 40px;
-  border-radius: var(--fn-radius-md);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.instanceCardTag {
   flex-shrink: 0;
+  margin-inline-end: 0;
 }
 
-.instanceCardMeta {
-  min-width: 0;
-}
-
-.instanceCardName {
-  font-weight: 600;
-  font-size: 14px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.instanceCardKind {
-  font-size: 12px;
-  color: var(--fn-text-tertiary);
+.instanceCardHeaderActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .instanceCardActions {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 6px;
   flex-shrink: 0;
+}
+
+.instanceCardDelBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: var(--fn-radius-sm);
+  border: 1px solid var(--fn-border-primary);
+  background: transparent;
+  cursor: pointer;
+  color: var(--fn-text-tertiary);
+  transition:
+    color 0.15s,
+    border-color 0.15s,
+    background 0.15s;
+
+  &:hover {
+    color: #ff4d4f;
+    border-color: #ff4d4f;
+    background: color-mix(in srgb, #ff4d4f 8%, transparent);
+  }
 }
 
 .connectorLogo {
@@ -487,6 +489,31 @@
   border-radius: var(--fn-radius-md);
 }
 
+.guidedSetup {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--fn-card-border-normal);
+  border-radius: var(--fn-radius-md);
+  background: color-mix(
+    in srgb,
+    var(--connector-accent, var(--fn-color-brand)) 4%,
+    var(--fn-bg-primary)
+  );
+  font-size: 13px;
+  color: var(--fn-text-secondary);
+
+  ol {
+    margin: 6px 0 0;
+    padding-left: 20px;
+    line-height: 1.65;
+  }
+}
+
+.guidedSetupTitle {
+  color: var(--fn-text-primary);
+  font-weight: 600;
+}
+
 .guideLinks {
   display: flex;
   flex-wrap: wrap;
@@ -603,15 +630,6 @@
 
 /* ── Tabs ──────────────────────────────────────────────────────── */
 
-.tabBar {
-  display: flex;
-  gap: 0;
-  margin-bottom: 16px;
-  border-bottom: 1px solid var(--fn-border-secondary);
-  flex-shrink: 0;
-  background: var(--fn-bg-container, var(--fn-bg-elevated));
-}
-
 .listToolbar {
   display: flex;
   align-items: center;
@@ -626,30 +644,6 @@
   line-height: 1.4;
   color: var(--fn-text-secondary);
   min-width: 0;
-}
-
-.tab {
-  padding: 10px 20px;
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--fn-text-secondary);
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  cursor: pointer;
-  transition:
-    color 0.15s ease,
-    border-color 0.15s ease;
-  margin-bottom: -1px;
-
-  &:hover {
-    color: var(--fn-text-primary);
-  }
-
-  &.active {
-    color: var(--fn-color-brand);
-    border-bottom-color: var(--fn-color-brand);
-  }
 }
 
 /* ── Custom MCP tab ────────────────────────────────────────────── */
@@ -695,6 +689,16 @@
 .customMcpToolbar {
   display: flex;
   justify-content: flex-start;
+}
+
+.customMcpPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: var(--fn-radius-lg);
+  background: var(--fn-bg-primary);
 }
 
 .customMcpJsonEditor {
@@ -926,6 +930,47 @@
   flex-shrink: 0;
 }
 
+.customMcpEnableControl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+}
+
+.customMcpEnableLabel {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fn-text-secondary);
+  white-space: nowrap;
+}
+
+.customMcpCardFooter {
+  display: flex;
+  align-items: center;
+  padding: 0 16px 14px;
+  margin-top: -4px;
+}
+
+.customMcpConnectLink {
+  font-size: 12px;
+  color: var(--mcp-accent);
+  font-weight: 500;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+
+  &:hover:not(:disabled) {
+    text-decoration: underline;
+  }
+
+  &:disabled {
+    opacity: 0.65;
+    cursor: wait;
+  }
+}
+
 .customMcpCardBody {
   display: flex;
   flex-direction: column;
@@ -979,6 +1024,36 @@
 
 .customMcpFooter {
   display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: var(--fn-radius-lg);
+  background: var(--fn-bg-primary);
+}
+
+.customMcpFooterMain {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.customMcpFooterHint {
+  margin: 0;
+  padding-left: 24px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fn-text-tertiary);
+}
+
+.customMcpFooterSave {
+  flex-shrink: 0;
+  align-self: center;
+}
+
+.customMcpFooterSaveOnly {
   justify-content: flex-end;
-  padding-top: 4px;
 }

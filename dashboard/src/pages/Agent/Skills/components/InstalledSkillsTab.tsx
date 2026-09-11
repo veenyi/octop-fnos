@@ -10,7 +10,7 @@ import { EmptyState } from "../../../../components/EmptyState";
 import { SkillCard } from "./SkillCard";
 import { SkillDrawer, type SkillFormValues } from "./SkillDrawer";
 import { SkillImportModal } from "./SkillImportModal";
-import { hubInfoBySlugFromCache } from "./skillHubCache";
+import { PushSkillToPackageModal } from "./PushSkillToPackageModal";
 import SkillsTable from "./SkillsTable";
 import type { SkillDetail, SkillSpec } from "../useSkills";
 import styles from "../index.module.less";
@@ -77,10 +77,9 @@ export default function InstalledSkillsTab({
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [editingSkill, setEditingSkill] = useState<SkillDetail | null>(null);
+  const [pushSkill, setPushSkill] = useState<SkillDetail | null>(null);
   const [hoverKey, setHoverKey] = useState<string | null>(null);
   const [form] = Form.useForm<SkillFormValues>();
-
-  const hubSkillsBySlug = useMemo(() => hubInfoBySlugFromCache(), []);
 
   const filteredSkills = useMemo(
     () =>
@@ -173,7 +172,6 @@ export default function InstalledSkillsTab({
           <SkillCard
             key={`${skill.kind}-${skill.slug}`}
             skill={skill}
-            hubInfo={hubSkillsBySlug.get(skill.slug)}
             isHover={hoverKey === skill.slug}
             onClick={() => void handleEdit(skill)}
             onMouseEnter={() => setHoverKey(skill.slug)}
@@ -285,7 +283,18 @@ export default function InstalledSkillsTab({
         workspaceReady={workspaceReady}
         onClose={handleDrawerClose}
         onSubmit={handleSubmit}
+        onPushToPackage={
+          kind === "custom" ? (skill) => setPushSkill(skill) : undefined
+        }
       />
+      {kind === "custom" ? (
+        <PushSkillToPackageModal
+          open={pushSkill != null}
+          agentId={agentId}
+          skill={pushSkill}
+          onClose={() => setPushSkill(null)}
+        />
+      ) : null}
     </>
   );
 }

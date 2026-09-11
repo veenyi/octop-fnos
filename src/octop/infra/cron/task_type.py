@@ -7,6 +7,8 @@ from typing import Literal
 CronTaskType = Literal["text", "agent"]
 DEFAULT_CRON_TASK_TYPE: CronTaskType = "agent"
 CRON_PROMPT_MAX_LEN = 2000
+CRON_NAME_MAX_LEN = 80
+CRON_NAME_FALLBACK_LEN = 40
 _CRON_TASK_TYPES = frozenset({"text", "agent"})
 
 
@@ -31,4 +33,21 @@ def require_cron_prompt(prompt: str) -> str:
         raise ValueError("prompt must not be empty")
     if len(text) > CRON_PROMPT_MAX_LEN:
         raise ValueError(f"prompt must be at most {CRON_PROMPT_MAX_LEN} characters")
+    return text
+
+
+def default_cron_name(prompt: str, cron_id: str) -> str:
+    """Build a readable fallback name from the prompt prefix, else *cron_id*."""
+    for line in prompt.splitlines():
+        text = " ".join(line.strip().split())
+        if text:
+            return text[:CRON_NAME_FALLBACK_LEN]
+    return cron_id
+
+
+def require_cron_name(name: str | None, *, prompt: str, cron_id: str) -> str:
+    """Return a non-empty display name; blank input falls back to the prompt prefix."""
+    text = (name or "").strip() or default_cron_name(prompt, cron_id)
+    if len(text) > CRON_NAME_MAX_LEN:
+        raise ValueError(f"name must be at most {CRON_NAME_MAX_LEN} characters")
     return text

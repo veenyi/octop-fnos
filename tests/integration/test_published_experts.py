@@ -58,6 +58,8 @@ async def test_publish_list_install_and_unpublish_preserves_installed_fork(
         json={"name": "Peer installed expert", "description": "Peer copy"},
     )
     assert installed.status_code == 201, installed.text
+    assert installed.json()["state"] == "starting"
+    assert installed.json()["bootstrap_pending"] is True
     installed_agent_id = installed.json()["agent_id"]
     assert installed.json()["user_id"] != expert["created_by"]
 
@@ -109,6 +111,189 @@ async def test_install_published_expert_accepts_create_options(
     assert body.get("max_iters") == 12
     config = body.get("config") or {}
     assert (config.get("backend") or {}).get("type") == "local_shell"
+
+
+async def test_install_published_expert_does_not_copy_source_composer_defaults(
+    env: tuple[Any, Any, dict[str, str]],
+) -> None:
+    client, server, owner_auth, peer_auth, source_agent_id = await _owner_and_peer(env)
+    source = (await client.get(f"/api/agents/{source_agent_id}", headers=owner_auth)).json()
+    owner_kb = server.services.knowledge_repo.create_base(
+        owner_user_id=source["user_id"], name="Publisher KB"
+    )
+    owner_connector = await client.post(
+        "/api/connector-instances",
+        headers=owner_auth,
+        json={
+            "kind": "tencent-docs",
+            "display_name": "Publisher docs",
+            "credentials": {"token": "owner-token"},
+        },
+    )
+    assert owner_connector.status_code == 201, owner_connector.text
+    patched = await client.patch(
+        f"/api/agents/{source_agent_id}",
+        headers=owner_auth,
+        json={
+            "knowledge_base_ids": [owner_kb.id],
+            "mcp_servers": [owner_connector.json()["mcp_server_name"]],
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["knowledge_base_ids"] == [owner_kb.id]
+
+    published = await client.post(
+        f"/api/agents/{source_agent_id}/publish-expert",
+        headers=owner_auth,
+        json={"name": "Published without composer defaults"},
+    )
+    assert published.status_code == 201, published.text
+    expert_id = published.json()["id"]
+    listed = await client.get("/api/experts/published", headers=peer_auth)
+    assert listed.status_code == 200, listed.text
+    card = next(row for row in listed.json() if row["id"] == expert_id)
+    assert "knowledge_base_ids" not in card
+    assert "mcp_servers" not in card
+    detail = await client.get(f"/api/experts/published/{expert_id}", headers=peer_auth)
+    assert detail.status_code == 200, detail.text
+    assert "knowledge_base_ids" not in detail.json()
+    assert "mcp_servers" not in detail.json()
+
+    installed = await client.post(
+        f"/api/experts/published/{expert_id}/install",
+        headers=peer_auth,
+        json={"name": "Fork without inherited defaults"},
+    )
+    assert installed.status_code == 201, installed.text
+    fork = (
+        await client.get(f"/api/agents/{installed.json()['agent_id']}", headers=peer_auth)
+    ).json()
+    assert fork["knowledge_base_ids"] == []
+    assert fork["mcp_servers"] == []
+
+    peer_kb = server.services.knowledge_repo.create_base(
+        owner_user_id=fork["user_id"], name="Installer KB"
+    )
+    peer_connector = await client.post(
+        "/api/connector-instances",
+        headers=peer_auth,
+        json={
+            "kind": "tencent-docs",
+            "display_name": "Installer docs",
+            "credentials": {"token": "peer-token"},
+        },
+    )
+    assert peer_connector.status_code == 201, peer_connector.text
+    mcp_name = peer_connector.json()["mcp_server_name"]
+    picked = await client.post(
+        f"/api/experts/published/{expert_id}/install",
+        headers=peer_auth,
+        json={
+            "name": "Fork with installer picks",
+            "knowledge_base_ids": [peer_kb.id],
+            "mcp_servers": [mcp_name],
+        },
+    )
+    assert picked.status_code == 201, picked.text
+    chosen = (
+        await client.get(f"/api/agents/{picked.json()['agent_id']}", headers=peer_auth)
+    ).json()
+    assert chosen["knowledge_base_ids"] == [peer_kb.id]
+    assert chosen["mcp_servers"] == [mcp_name]
+    assert owner_kb.id not in chosen["knowledge_base_ids"]
+    assert owner_connector.json()["mcp_server_name"] not in chosen["mcp_servers"]
+
+
+@posix_only
+async def test_install_keeps_source_quick_prompts_when_publish_body_omits_them(
+    env: tuple[Any, Any, dict[str, str]],
+) -> None:
+    client, _server, admin_auth = env
+    owner_auth = await create_user(client, admin_auth, username="quickcard_owner")
+    peer_auth = await create_user(client, admin_auth, username="quickcard_peer")
+    created = await client.post(
+        "/api/agents/from-expert/ai-coding-coach",
+        headers=owner_auth,
+        json={"name": "quickcard-source"},
+    )
+    assert created.status_code == 201, created.text
+    source_agent_id = created.json()["agent_id"]
+
+    source_welcome = await client.get(
+        f"/api/agents/{source_agent_id}/chat/welcome",
+        headers=owner_auth,
+    )
+    assert source_welcome.status_code == 200, source_welcome.text
+    source_prompts = source_welcome.json()["quick_prompts"]
+    assert source_prompts
+
+    published = await client.post(
+        f"/api/agents/{source_agent_id}/publish-expert",
+        headers=owner_auth,
+        json={
+            "name": "Quick card expert",
+            "welcome_message": {"zh": "开始写代码吧", "en": "Let's write code"},
+        },
+    )
+    assert published.status_code == 201, published.text
+
+    installed = await client.post(
+        f"/api/experts/published/{published.json()['id']}/install",
+        headers=peer_auth,
+        json={"name": "Quick card fork"},
+    )
+    assert installed.status_code == 201, installed.text
+
+    unpublished = await client.delete(
+        f"/api/experts/published/{published.json()['id']}",
+        headers=owner_auth,
+    )
+    assert unpublished.status_code == 204, unpublished.text
+
+    fork_welcome = await client.get(
+        f"/api/agents/{installed.json()['agent_id']}/chat/welcome",
+        headers=peer_auth,
+    )
+    assert fork_welcome.status_code == 200, fork_welcome.text
+    assert fork_welcome.json()["quick_prompts"] == source_prompts
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+
+async def test_published_list_exposes_snapshot_avatar(
+    env: tuple[Any, Any, dict[str, str]],
+) -> None:
+    client, _server, owner_auth, peer_auth, source_agent_id = await _owner_and_peer(env)
+
+    uploaded = await client.post(
+        f"/api/agents/{source_agent_id}/avatar",
+        headers=owner_auth,
+        files={"file": ("face.png", PNG, "image/png")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+
+    published = await client.post(
+        f"/api/agents/{source_agent_id}/publish-expert",
+        headers=owner_auth,
+        json={"name": "Avatar published"},
+    )
+    assert published.status_code == 201, published.text
+    expert_id = published.json()["id"]
+    icon_url = published.json().get("icon_url")
+    assert isinstance(icon_url, str)
+    assert icon_url.startswith(f"/api/experts/published/{expert_id}/avatar")
+    assert "v=" in icon_url
+
+    listed = await client.get("/api/experts/published", headers=peer_auth)
+    assert listed.status_code == 200, listed.text
+    row = next(item for item in listed.json() if item["id"] == expert_id)
+    assert row["icon_url"] == icon_url
+
+    got = await client.get(icon_url, headers=peer_auth)
+    assert got.status_code == 200, got.text
+    assert got.content == PNG
+    assert got.headers["content-type"].startswith("image/png")
 
 
 async def test_creator_can_refresh_published_expert(

@@ -11,6 +11,8 @@ from pydantic import Field
 
 from octop.infra.cron.manager import CronCreateSpec
 from octop.infra.cron.task_type import (
+    CRON_NAME_MAX_LEN,
+    require_cron_name,
     require_cron_prompt,
     require_cron_task_type,
 )
@@ -36,9 +38,11 @@ _TASK_TYPE_HELP = (
 _CRONJOB_CREATE_DESC = (
     "Create a scheduled cron job bound to the current conversation session. "
     "Results are delivered to the same channel (QQ/WeChat/dashboard/…). "
+    "name is required: a short label for the job list. "
     f"task_type: {_TASK_TYPE_HELP} "
-    "Examples: 'remind me to drink water at 14:00 daily' → task_type=text, prompt='该喝水了💧'; "
-    "'summarize my inbox every morning' → task_type=agent. "
+    "Examples: 'remind me to drink water at 14:00 daily' → "
+    "name='Daily water reminder', task_type=text, prompt='Time to drink water'; "
+    "'summarize my inbox every morning' → name='Morning inbox summary', task_type=agent. "
     f"trigger: {_TRIGGER_HELP}"
 )
 
@@ -64,9 +68,20 @@ def _tool_ctx() -> tuple[str, int, str]:
     return str(agent_id), user_id, str(session_key)
 
 
+def _user_owns_agent(mgr: CronManager, agent_id: str, user_id: int) -> bool:
+    row = mgr._repos.agent_repo.get(agent_id)
+    return row is not None and row.user_id == user_id
+
+
+def _require_agent_owner(mgr: CronManager, agent_id: str, user_id: int) -> None:
+    if not _user_owns_agent(mgr, agent_id, user_id):
+        raise ValueError("cron jobs can only be managed by the expert owner")
+
+
 def _get_owned(mgr: CronManager, cron_id: str, agent_id: str, user_id: int) -> CronJobRow:
+    _require_agent_owner(mgr, agent_id, user_id)
     row = mgr.get(cron_id)
-    if row is None or row.agent_id != agent_id or row.user_id != user_id:
+    if row is None or row.agent_id != agent_id:
         raise ValueError(f"cron job not found: {cron_id}")
     return row
 
@@ -86,11 +101,9 @@ def build_cronjob_tools(cron_manager: CronManager) -> list[StructuredTool]:
     async def cronjob_list(include_disabled: bool = True) -> str:
         try:
             agent_id, user_id, _session_key = _tool_ctx()
-            rows = [
-                r
-                for r in mgr.list_by_agent(agent_id, include_disabled=include_disabled)
-                if r.user_id == user_id
-            ]
+            if not _user_owns_agent(mgr, agent_id, user_id):
+                return _ok([])
+            rows = mgr.list_by_agent(agent_id, include_disabled=include_disabled)
             return _ok([r.to_public_dict() for r in rows])
         except Exception as exc:
             return _err(exc)
@@ -117,6 +130,16 @@ def build_cronjob_tools(cron_manager: CronManager) -> list[StructuredTool]:
                 ),
             ),
         ],
+        name: Annotated[
+            str,
+            Field(
+                description=(
+                    "Required short display name shown in the job list "
+                    f"(max {CRON_NAME_MAX_LEN} characters). "
+                    "Summarize the user's request, e.g. 'Daily water reminder'."
+                ),
+            ),
+        ],
         fresh_thread: Annotated[
             bool,
             Field(description="If true, reset conversation context before each agent run."),
@@ -132,12 +155,16 @@ def build_cronjob_tools(cron_manager: CronManager) -> list[StructuredTool]:
     ) -> str:
         try:
             agent_id, user_id, session_key = _tool_ctx()
+            _require_agent_owner(mgr, agent_id, user_id)
+            cron_id = new_cron_id()
+            cleaned_prompt = require_cron_prompt(prompt)
             spec = CronCreateSpec(
-                cron_id=new_cron_id(),
+                cron_id=cron_id,
                 agent_id=agent_id,
                 user_id=user_id,
+                name=require_cron_name(name, prompt=cleaned_prompt, cron_id=cron_id),
                 trigger=trigger,
-                prompt=require_cron_prompt(prompt),
+                prompt=cleaned_prompt,
                 fresh_thread=fresh_thread,
                 session_key=session_key,
                 enabled=enabled,
@@ -150,6 +177,7 @@ def build_cronjob_tools(cron_manager: CronManager) -> list[StructuredTool]:
 
     async def cronjob_update(
         cron_id: str,
+        name: Annotated[str | None, Field(description="New display name.")] = None,
         trigger: Annotated[str | None, Field(description=f"New schedule. {_TRIGGER_HELP}")] = None,
         prompt: Annotated[
             str | None,
@@ -161,11 +189,21 @@ def build_cronjob_tools(cron_manager: CronManager) -> list[StructuredTool]:
     ) -> str:
         try:
             agent_id, user_id, _session_key = _tool_ctx()
-            _get_owned(mgr, cron_id, agent_id, user_id)
+            existing = _get_owned(mgr, cron_id, agent_id, user_id)
+            cleaned_prompt = require_cron_prompt(prompt) if prompt is not None else None
             row = await mgr.update(
                 cron_id,
+                name=(
+                    require_cron_name(
+                        name,
+                        prompt=cleaned_prompt or existing.prompt,
+                        cron_id=cron_id,
+                    )
+                    if name is not None
+                    else None
+                ),
                 trigger=trigger,
-                prompt=require_cron_prompt(prompt) if prompt is not None else None,
+                prompt=cleaned_prompt,
                 fresh_thread=fresh_thread,
                 enabled=int(enabled) if enabled is not None else None,
                 task_type=require_cron_task_type(task_type) if task_type is not None else None,

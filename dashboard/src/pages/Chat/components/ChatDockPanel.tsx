@@ -10,9 +10,11 @@ import React, {
 } from "react";
 import { Spin, Tooltip } from "antd";
 import {
+  BookOpen,
   FilePen,
   FolderOpen,
   Globe,
+  Puzzle,
   RefreshCw,
   Terminal,
   X,
@@ -23,12 +25,15 @@ import BrowserWorkspace, {
 } from "../../../components/BrowserWorkspace";
 import ChatDockPanelShell from "../../../components/BrowserWorkspace/ChatDockPanelShell";
 import type { DisplayEnvironment } from "../../../api/types/browser";
+import { useCurrentUser } from "../../../hooks/useCurrentUser";
 import { resolveBrowserProfile } from "../../../utils/browserProfile";
 import type { DockTab, DockTabId } from "../hooks/useChatDockPanel";
 import { dockFileBasename } from "../utils/dockFilePath";
 import styles from "../index.module.less";
 import ChatDockFileList from "./ChatDockFileList";
 import FilePanelContent from "./FilePanelContent";
+import KnowledgeCitationPanelContent from "./KnowledgeCitationPanelContent";
+import ChatDockToolUiContent from "./ChatDockToolUiContent";
 
 const TerminalPage = lazy(() => import("../../Control/Terminal"));
 
@@ -45,6 +50,8 @@ interface ChatDockPanelProps {
   onCloseTab: (id: DockTabId) => void;
   onOpenFile: (path: string) => void;
   browserEnvironment?: DisplayEnvironment;
+  threadId?: string | null;
+  isStreamingTurn?: boolean;
   /**
    * False while the chat dock shell is closed but keep-alive mounted.
    * Mirrors Workbench ``isVisible`` so terminal does not treat hide as a
@@ -70,9 +77,12 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
   onCloseTab,
   onOpenFile,
   browserEnvironment = "desktop",
+  threadId = null,
+  isStreamingTurn = false,
   surfaceVisible = true,
 }) => {
   const { t } = useTranslation();
+  const currentUser = useCurrentUser();
   const [browserMounted, setBrowserMounted] = useState(
     openTabs.some((tab) => tab.kind === "browser"),
   );
@@ -82,11 +92,24 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
   const [mountedFilePaths, setMountedFilePaths] = useState<string[]>(() =>
     openTabs.filter((tab) => tab.kind === "file").map((tab) => tab.path),
   );
+  const [mountedKnowledgeTabs, setMountedKnowledgeTabs] = useState<
+    Extract<DockTab, { kind: "knowledge" }>[]
+  >(() => openTabs.filter((tab) => tab.kind === "knowledge"));
+  const [mountedToolUiCallIds, setMountedToolUiCallIds] = useState<string[]>(
+    () =>
+      openTabs.filter((tab) => tab.kind === "toolUi").map((tab) => tab.callId),
+  );
   const [fileActionsByPath, setFileActionsByPath] = useState<
+    Record<string, ReactNode>
+  >({});
+  const [knowledgeActionsById, setKnowledgeActionsById] = useState<
     Record<string, ReactNode>
   >({});
   const browserRefreshRef = useRef<(() => void) | null>(null);
   const fileActionsHandlersRef = useRef<
+    Record<string, (actions: ReactNode | null) => void>
+  >({});
+  const knowledgeActionsHandlersRef = useRef<
     Record<string, (actions: ReactNode | null) => void>
   >({});
 
@@ -98,12 +121,48 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
     const openFilePaths = new Set(
       openTabs.filter((tab) => tab.kind === "file").map((tab) => tab.path),
     );
+    const openKnowledgeById = new Map(
+      openTabs
+        .filter(
+          (tab): tab is Extract<DockTab, { kind: "knowledge" }> =>
+            tab.kind === "knowledge",
+        )
+        .map((tab) => [tab.id, tab]),
+    );
+    const openToolUiCallIds = new Set(
+      openTabs.filter((tab) => tab.kind === "toolUi").map((tab) => tab.callId),
+    );
     setMountedFilePaths((prev) => {
       const next = prev.filter((path) => openFilePaths.has(path));
       let changed = next.length !== prev.length;
       for (const path of openFilePaths) {
         if (!next.includes(path)) {
           next.push(path);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setMountedKnowledgeTabs((prev) => {
+      const next = prev
+        .filter((tab) => openKnowledgeById.has(tab.id))
+        .map((tab) => openKnowledgeById.get(tab.id) ?? tab);
+      let changed =
+        next.length !== prev.length || next.some((tab, i) => tab !== prev[i]);
+      for (const tab of openKnowledgeById.values()) {
+        if (!next.some((row) => row.id === tab.id)) {
+          next.push(tab);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setMountedToolUiCallIds((prev) => {
+      const next = prev.filter((callId) => openToolUiCallIds.has(callId));
+      let changed = next.length !== prev.length;
+      for (const callId of openToolUiCallIds) {
+        if (!next.includes(callId)) {
+          next.push(callId);
           changed = true;
         }
       }
@@ -118,6 +177,19 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
         } else {
           changed = true;
           delete fileActionsHandlersRef.current[path];
+        }
+      }
+      return changed ? next : prev;
+    });
+    setKnowledgeActionsById((prev) => {
+      let changed = false;
+      const next: Record<string, ReactNode> = {};
+      for (const id of Object.keys(prev)) {
+        if (openKnowledgeById.has(id)) {
+          next[id] = prev[id];
+        } else {
+          changed = true;
+          delete knowledgeActionsHandlersRef.current[id];
         }
       }
       return changed ? next : prev;
@@ -147,7 +219,26 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
     return handler;
   }, []);
 
-  const sessionId = resolveBrowserProfile();
+  const getKnowledgeActionsHandler = useCallback((tabId: string) => {
+    const existing = knowledgeActionsHandlersRef.current[tabId];
+    if (existing) return existing;
+    const handler = (actions: ReactNode | null) => {
+      setKnowledgeActionsById((prev) => {
+        if (actions == null) {
+          if (!(tabId in prev)) return prev;
+          const next = { ...prev };
+          delete next[tabId];
+          return next;
+        }
+        if (prev[tabId] === actions) return prev;
+        return { ...prev, [tabId]: actions };
+      });
+    };
+    knowledgeActionsHandlersRef.current[tabId] = handler;
+    return handler;
+  }, []);
+
+  const sessionId = resolveBrowserProfile(currentUser?.id);
   const activeTab =
     openTabs.find((tab) => tab.id === activeTabId) ?? openTabs[0] ?? null;
   const terminalVisible = surfaceVisible && activeTab?.kind === "terminal";
@@ -171,6 +262,22 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
             <>
               <Terminal size={16} strokeWidth={2} aria-hidden />
               <span>{t("chat.dockTerminalTitle", "终端")}</span>
+            </>
+          ) : tab.kind === "toolUi" ? (
+            <>
+              <Puzzle size={16} strokeWidth={2} aria-hidden />
+              <span title={tab.title ?? tab.toolName}>
+                {tab.title ??
+                  tab.toolName ??
+                  t("chat.dockToolUiTitle", "Plugin tool")}
+              </span>
+            </>
+          ) : tab.kind === "knowledge" ? (
+            <>
+              <BookOpen size={16} strokeWidth={2} aria-hidden />
+              <span title={tab.citation.filename}>
+                {tab.citation.filename || t("chat.citationPreview")}
+              </span>
             </>
           ) : (
             <>
@@ -229,8 +336,11 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
     if (activeTab?.kind === "file") {
       return fileActionsByPath[activeTab.path] ?? null;
     }
+    if (activeTab?.kind === "knowledge") {
+      return knowledgeActionsById[activeTab.id] ?? null;
+    }
     return null;
-  }, [activeTab, fileActionsByPath, t]);
+  }, [activeTab, fileActionsByPath, knowledgeActionsById, t]);
 
   return (
     <ChatDockPanelShell
@@ -277,6 +387,24 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
           );
         })}
 
+        {mountedKnowledgeTabs.map((tab) => {
+          const isActive =
+            activeTab?.kind === "knowledge" && activeTab.id === tab.id;
+          return (
+            <div
+              key={tab.id}
+              className={styles.dockTabBody}
+              hidden={!isActive}
+              style={{ display: isActive ? "flex" : "none" }}
+            >
+              <KnowledgeCitationPanelContent
+                citation={tab.citation}
+                onActionsChange={getKnowledgeActionsHandler(tab.id)}
+              />
+            </div>
+          );
+        })}
+
         {browserMounted && (
           <div
             className={styles.dockTabBody}
@@ -312,6 +440,26 @@ const ChatDockPanel: React.FC<ChatDockPanelProps> = ({
             </Suspense>
           </div>
         )}
+
+        {mountedToolUiCallIds.map((callId) => {
+          const isActive =
+            activeTab?.kind === "toolUi" && activeTab.callId === callId;
+          return (
+            <div
+              key={callId}
+              className={styles.dockTabBody}
+              hidden={!isActive}
+              style={{ display: isActive ? "flex" : "none" }}
+            >
+              <ChatDockToolUiContent
+                threadId={threadId}
+                callId={callId}
+                agentId={agentId}
+                isStreamingTurn={isStreamingTurn}
+              />
+            </div>
+          );
+        })}
       </div>
     </ChatDockPanelShell>
   );

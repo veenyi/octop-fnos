@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -14,11 +15,19 @@ from octop.infra.connectors.crypto import decrypt_credentials, encrypt_credentia
 from octop.infra.connectors.custom_mcp import (
     CUSTOM_MCP_DISPLAY_NAME,
     CUSTOM_MCP_KIND,
+    build_oauth_storage,
     enabled_harness_configs,
     expand_custom_instances,
     extract_servers,
     is_custom_mcp_kind,
+    mark_oauth_reauth_required,
+    merge_preserved_oauth,
+    oauth_configured,
+    oauth_tokens_from_spec,
+    redact_servers_for_api,
     server_enabled,
+    set_oauth_required_in_spec,
+    shared_mcp_server_name,
     validate_servers_map,
     wrap_servers,
 )
@@ -29,11 +38,20 @@ from octop.infra.connectors.gateway.feishu_user_auth import (
     start_user_device_login,
 )
 from octop.infra.connectors.oauth import refresh_oauth_credentials
+from octop.infra.connectors.oauth.registry import refresh_custom_mcp_oauth
 from octop.infra.db.repos.connectors import ConnectorRepo, ConnectorRow
 from octop.infra.db.repos.secrets import SecretRepo
 from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.utils.paths import PathLayout
 from octop.infra.utils.ulid import new_ulid
+
+logger = logging.getLogger(__name__)
+
+_OAUTH_REFRESH_SKEW_SEC = 120
+
+
+class ConnectorNameTakenError(ValueError):
+    """Raised when a connector display name is already owned by the user."""
 
 
 def list_user_connector_instances(
@@ -140,11 +158,27 @@ class ConnectorService:
             return {}
         return extract_servers(self.decrypt(row.instance_id))
 
+    def get_custom_servers_for_api(self, user_id: int) -> dict[str, Any]:
+        return redact_servers_for_api(self.get_custom_servers(user_id))
+
     def put_custom_servers(self, user_id: int, servers: dict[str, Any]) -> dict[str, Any]:
+        existing = self.get_custom_servers(user_id)
+        merged = merge_preserved_oauth(servers, existing)
+        return self._save_custom_servers(user_id, merged)
+
+    def _save_custom_servers(self, user_id: int, servers: dict[str, Any]) -> dict[str, Any]:
         normalized = validate_servers_map(
             servers,
             reserved_names=self.reserved_builtin_mcp_names(user_id),
         )
+        display_names: set[str] = set()
+        for name, spec in normalized.items():
+            display_name = (
+                str(spec.get("display_name") or "").strip() if isinstance(spec, dict) else ""
+            ) or name
+            if display_name in display_names or self._repo.name_exists(user_id, display_name):
+                raise ConnectorNameTakenError(display_name)
+            display_names.add(display_name)
         row = self._repo.get_by_user_kind(user_id, CUSTOM_MCP_KIND)
         if not normalized:
             if row is not None:
@@ -167,6 +201,69 @@ class ConnectorService:
         )
         return normalized
 
+    def apply_custom_server_oauth(
+        self,
+        user_id: int,
+        server_name: str,
+        tokens: dict[str, Any],
+        *,
+        issuer: str,
+        resource: str | None,
+    ) -> dict[str, Any]:
+        servers = dict(self.get_custom_servers(user_id))
+        if server_name not in servers:
+            raise KeyError(server_name)
+        access = str(tokens.get("access_token") or "").strip()
+        if not access:
+            raise ValueError("missing access_token")
+        spec = dict(servers[server_name])
+        spec["oauth"] = build_oauth_storage(tokens, issuer=issuer, resource=resource)
+        spec = set_oauth_required_in_spec(spec, required=False)
+        servers[server_name] = spec
+        return self._save_custom_servers(user_id, servers)
+
+    async def ensure_fresh_custom_servers(self, user_id: int) -> dict[str, Any]:
+        servers = dict(self.get_custom_servers(user_id))
+        changed = False
+        now = int(time.time())
+        for name, raw in list(servers.items()):
+            if not isinstance(raw, dict):
+                continue
+            oauth = oauth_tokens_from_spec(raw)
+            if not oauth_configured(raw):
+                continue
+            expires_at_raw = oauth.get("expires_at")
+            expires_at = int(expires_at_raw) if expires_at_raw is not None else None
+            refresh = str(oauth.get("refresh_token") or "").strip()
+            if expires_at is not None and expires_at <= now and not refresh:
+                servers[name] = mark_oauth_reauth_required(dict(raw))
+                changed = True
+                continue
+            if not refresh:
+                continue
+            if expires_at is not None and expires_at > now + _OAUTH_REFRESH_SKEW_SEC:
+                continue
+            try:
+                refreshed = await refresh_custom_mcp_oauth(oauth)
+            except Exception:
+                logger.warning(
+                    "custom MCP oauth refresh failed for %r (user_id=%s)",
+                    name,
+                    user_id,
+                    exc_info=True,
+                )
+                if expires_at is not None and expires_at <= now:
+                    servers[name] = mark_oauth_reauth_required(dict(raw))
+                    changed = True
+                continue
+            spec = dict(raw)
+            spec["oauth"] = refreshed
+            servers[name] = spec
+            changed = True
+        if not changed:
+            return servers
+        return self._save_custom_servers(user_id, servers)
+
     def patch_custom_server_enabled(
         self,
         user_id: int,
@@ -174,13 +271,51 @@ class ConnectorService:
         *,
         enabled: bool,
     ) -> dict[str, Any]:
+        return self.patch_custom_server(user_id, server_name, enabled=enabled)
+
+    def patch_custom_server(
+        self,
+        user_id: int,
+        server_name: str,
+        *,
+        enabled: bool | None = None,
+        default_open: bool | None = None,
+        shared: bool | None = None,
+    ) -> dict[str, Any]:
         servers = dict(self.get_custom_servers(user_id))
         if server_name not in servers:
             raise KeyError(server_name)
         spec = dict(servers[server_name])
-        spec["enabled"] = enabled
+        if enabled is not None:
+            spec["enabled"] = enabled
+            if not enabled:
+                spec.pop("default_open", None)
+        if default_open is not None:
+            if default_open:
+                spec["default_open"] = True
+            else:
+                spec.pop("default_open", None)
+        if shared is not None:
+            if shared:
+                spec["shared"] = True
+            else:
+                spec.pop("shared", None)
         servers[server_name] = spec
         return self.put_custom_servers(user_id, servers)
+
+    def note_custom_server_oauth_required(
+        self,
+        user_id: int,
+        server_name: str,
+        *,
+        required: bool,
+    ) -> dict[str, Any]:
+        servers = dict(self.get_custom_servers(user_id))
+        if server_name not in servers:
+            raise KeyError(server_name)
+        spec = dict(servers[server_name])
+        servers[server_name] = set_oauth_required_in_spec(spec, required=required)
+        return self._save_custom_servers(user_id, servers)
 
     def patch_custom_server_default_open(
         self,
@@ -189,33 +324,28 @@ class ConnectorService:
         *,
         default_open: bool,
     ) -> dict[str, Any]:
-        servers = dict(self.get_custom_servers(user_id))
-        if server_name not in servers:
-            raise KeyError(server_name)
-        spec = dict(servers[server_name])
-        if default_open:
-            spec["default_open"] = True
-        else:
-            spec.pop("default_open", None)
-        servers[server_name] = spec
-        return self.put_custom_servers(user_id, servers)
+        return self.patch_custom_server(user_id, server_name, default_open=default_open)
 
     def list_instances_for_api(self, user_id: int) -> list[dict[str, Any]]:
         """Built-in rows + expanded custom servers (hide parent custom-mcp row)."""
         out: list[dict[str, Any]] = []
         custom_row = self._repo.get_by_user_kind(user_id, CUSTOM_MCP_KIND)
-        for inst in self._repo.list_by_user(user_id):
+        for inst in self._repo.list_visible(user_id):
             if is_custom_mcp_kind(inst.kind):
                 continue
+            config = ConnectorRepo.parse_config_json(inst)
             out.append(
                 {
                     "instance_id": inst.instance_id,
                     "kind": inst.kind,
                     "display_name": inst.display_name,
+                    "description": config.get("description"),
                     "status": inst.status,
                     "mcp_server_name": inst.mcp_server_name,
                     "has_credentials": inst.has_credentials,
-                    "default_open": read_default_open(ConnectorRepo.parse_config_json(inst)),
+                    "default_open": read_default_open(config),
+                    "shared": inst.shared,
+                    "owner_user_id": inst.user_id,
                     "created_at": inst.created_at,
                     "updated_at": inst.updated_at,
                 }
@@ -227,11 +357,24 @@ class ConnectorService:
                     servers=extract_servers(self.decrypt(custom_row.instance_id)),
                 )
             )
+        for parent in self._repo.list_by_kind(CUSTOM_MCP_KIND):
+            if parent.user_id == user_id or not parent.has_credentials:
+                continue
+            out.extend(
+                expand_custom_instances(
+                    parent=parent,
+                    servers=extract_servers(self.decrypt(parent.instance_id)),
+                    shared_view=True,
+                )
+            )
+        for item in out:
+            item.setdefault("owner_user_id", user_id)
+            item.setdefault("shared", False)
         return out
 
     def list_active_mcp_server_names(self, user_id: int) -> list[str]:
         names: list[str] = []
-        for inst in self._repo.list_by_user(user_id):
+        for inst in self._repo.list_visible(user_id):
             if is_custom_mcp_kind(inst.kind):
                 continue
             if inst.status != "active" or not inst.has_credentials:
@@ -240,6 +383,12 @@ class ConnectorService:
         for name, spec in self.get_custom_servers(user_id).items():
             if isinstance(spec, dict) and server_enabled(spec):
                 names.append(name)
+        for parent in self._repo.list_by_kind(CUSTOM_MCP_KIND):
+            if parent.user_id == user_id or not parent.has_credentials:
+                continue
+            for name, spec in extract_servers(self.decrypt(parent.instance_id)).items():
+                if isinstance(spec, dict) and spec.get("shared") is True and server_enabled(spec):
+                    names.append(shared_mcp_server_name(parent.instance_id, name))
         return sorted(names)
 
     def list_default_open_mcp_server_names(self, user_id: int) -> list[str]:
@@ -265,16 +414,26 @@ class ConnectorService:
         explicit: list[str] | None,
         *,
         apply_defaults: bool | None = None,
+        extra_defaults: list[str] | None = None,
     ) -> list[str] | None:
         """Resolve turn MCP servers vs the user's default_open set.
 
         Dashboard passes an explicit list (``apply_defaults=False``) so users can
         opt out for a turn. IM uses ``explicit is None`` + defaults. Cron follows
         defaults when the job has no picks; explicit Cron picks win as-is.
+        ``extra_defaults`` (expert composer picks) are unioned with default_open
+        when defaults apply, but only names still available to *user_id*.
         """
+        defaults = list(self.list_default_open_mcp_server_names(user_id))
+        if extra_defaults:
+            allowed = set(self.list_active_mcp_server_names(user_id))
+            for name in extra_defaults:
+                text = str(name).strip()
+                if text and text in allowed and text not in defaults:
+                    defaults.append(text)
         return merge_mcp_servers_with_defaults(
             explicit,
-            self.list_default_open_mcp_server_names(user_id),
+            defaults,
             apply_defaults=apply_defaults,
         )
 
@@ -286,11 +445,26 @@ class ConnectorService:
         return list(names)
 
     def custom_harness_configs(self, user_id: int) -> dict[str, Any]:
-        return enabled_harness_configs(self.get_custom_servers(user_id))
+        configs = enabled_harness_configs(self.get_custom_servers(user_id))
+        for parent in self._repo.list_by_kind(CUSTOM_MCP_KIND):
+            if parent.user_id == user_id or not parent.has_credentials:
+                continue
+            servers = extract_servers(self.decrypt(parent.instance_id))
+            for name, spec in servers.items():
+                if (
+                    not isinstance(spec, dict)
+                    or spec.get("shared") is not True
+                    or not server_enabled(spec)
+                ):
+                    continue
+                built = enabled_harness_configs({name: spec}).get(name)
+                if built is not None:
+                    configs[shared_mcp_server_name(parent.instance_id, name)] = built
+        return configs
 
     async def mcp_configs_for_user(self, user_id: int) -> dict[str, Any]:
         configs: dict[str, Any] = {}
-        for inst in self._repo.list_by_user(user_id):
+        for inst in self._repo.list_visible(user_id):
             if inst.status != "active":
                 continue
             if is_custom_mcp_kind(inst.kind):
@@ -307,6 +481,15 @@ class ConnectorService:
                 creds=creds,
                 config=self._config,
             )
+        await self.ensure_fresh_custom_servers(user_id)
+        for parent in self._repo.list_by_kind(CUSTOM_MCP_KIND):
+            if parent.user_id == user_id or not parent.has_credentials:
+                continue
+            servers = extract_servers(self.decrypt(parent.instance_id))
+            if any(
+                isinstance(spec, dict) and spec.get("shared") is True for spec in servers.values()
+            ):
+                await self.ensure_fresh_custom_servers(parent.user_id)
         configs.update(self.custom_harness_configs(user_id))
         return configs
 

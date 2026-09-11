@@ -2,6 +2,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  Alert,
+  App,
   Button,
   Collapse,
   Drawer,
@@ -12,14 +14,13 @@ import {
   Select,
   Spin,
   Switch,
-  Alert,
 } from "antd";
-import { message } from "@/utils/antdMessage";
 
 import { MoreHorizontal } from "lucide-react";
 import { request } from "../../../api/request";
 import { AgentAdvancedConfigFields } from "../../../components/AgentAdvancedConfigFields";
 import ExpertColorPicker from "../../../components/ExpertColorPicker";
+import AgentTrajectoryField from "./AgentTrajectoryField";
 import { workspaceApi } from "../../../api/modules/workspace";
 import { skillPackagesApi } from "../../../api/modules/skillPackages";
 import { apiErrorMessage, isNotFoundApiError } from "../../../utils/apiError";
@@ -49,6 +50,7 @@ import {
   readAgentRuntimeFormValues,
 } from "../../../utils/agentRuntimeConfig";
 import { useSkillDisplayName } from "../../Agent/Skills/skillDisplayNames";
+import { DEFAULT_SKILL_EMOJI } from "../../Agent/Skills/skillMarkdown";
 import FileEditModal from "./FileEditModal";
 import WelcomeConfig, { type WelcomeConfigRef } from "./WelcomeConfig";
 import {
@@ -73,6 +75,7 @@ import {
   type PathMapping,
 } from "./agentBackendForm";
 import AgentBackendFields from "./AgentBackendFields";
+import ExpertComposerDefaultsFields from "./ExpertComposerDefaultsFields";
 import SubagentCatalogDrawer from "./SubagentCatalogDrawer";
 import styles from "../index.module.less";
 
@@ -89,6 +92,8 @@ interface AgentDetail {
   top_p?: number | null;
   max_tokens?: number | null;
   welcome_message?: string | null;
+  knowledge_base_ids?: string[];
+  mcp_servers?: string[];
   config?: Record<string, unknown>;
 }
 
@@ -98,6 +103,8 @@ interface SkillSummary {
   description?: string;
   enabled?: boolean;
   kind?: "builtin" | "workspace";
+  emoji?: string;
+  icon_url?: string;
 }
 
 interface SubagentSummary {
@@ -130,6 +137,9 @@ interface EditFormValues {
   temperature?: number;
   top_p?: number;
   max_tokens?: number;
+  enable_trajectory?: boolean;
+  knowledge_base_ids?: string[];
+  mcp_servers?: string[];
 }
 
 interface EditAgentDrawerProps {
@@ -208,6 +218,7 @@ function EditAgentDrawerBody({
   onSavingChange,
 }: EditAgentDrawerBodyProps) {
   const { t } = useTranslation();
+  const { modal, message } = App.useApp();
   const { refresh } = useAgent();
   const skillDisplayName = useSkillDisplayName();
   const [workspaceDrawerOpen, setWorkspaceDrawerOpen] = useState(false);
@@ -296,6 +307,11 @@ function EditAgentDrawerBody({
           composite_default: parsedBackend.compositeDefault,
           root_dir: parsedBackend.rootDir,
           ...readAgentRuntimeFormValues(ag),
+          enable_trajectory: cfg.enable_trajectory !== false,
+          knowledge_base_ids: Array.isArray(ag.knowledge_base_ids)
+            ? ag.knowledge_base_ids
+            : [],
+          mcp_servers: Array.isArray(ag.mcp_servers) ? ag.mcp_servers : [],
         });
         setLoading(false);
 
@@ -391,6 +407,7 @@ function EditAgentDrawerBody({
       const nextConfig = omitAgentRuntimeConfig({
         ...agentConfig,
         backend: backendSpec,
+        enable_trajectory: values.enable_trajectory === true,
       });
       delete nextConfig.color;
       delete nextConfig.icon_name;
@@ -399,6 +416,8 @@ function EditAgentDrawerBody({
       delete nextConfig.skill_package_ids;
       delete nextConfig.published_expert_id;
       delete nextConfig.welcome_message;
+      delete nextConfig.knowledge_base_ids;
+      delete nextConfig.mcp_servers;
 
       // Persist page config before PATCH. Workspace I/O survives the
       // background harness reload; skip when the editor is still loading
@@ -436,6 +455,8 @@ function EditAgentDrawerBody({
           color: nextColor,
           config: nextConfig,
           welcome_message: stored.welcome_message ?? "",
+          knowledge_base_ids: stored.knowledge_base_ids ?? [],
+          mcp_servers: stored.mcp_servers ?? [],
           ...buildAgentRuntimeRequest(values, { clearMissing: true }),
         }),
       });
@@ -548,7 +569,7 @@ function EditAgentDrawerBody({
   };
 
   const confirmDeleteConfigFile = (path: string) => {
-    Modal.confirm({
+    modal.confirm({
       title: t("workspace.deleteConfirm"),
       okText: t("common.delete"),
       cancelText: t("common.cancel"),
@@ -563,7 +584,7 @@ function EditAgentDrawerBody({
 
   const confirmDeleteSkill = (skill: SkillSummary) => {
     const slug = skill.slug ?? skill.name;
-    Modal.confirm({
+    modal.confirm({
       title: t("skills.deleteConfirmContent", { slug }),
       okText: t("common.delete"),
       cancelText: t("common.cancel"),
@@ -579,7 +600,7 @@ function EditAgentDrawerBody({
   };
 
   const confirmDeleteSubagent = (subagent: SubagentSummary) => {
-    Modal.confirm({
+    modal.confirm({
       title: t("workspace.deleteConfirm"),
       okText: t("common.delete"),
       cancelText: t("common.cancel"),
@@ -785,10 +806,13 @@ function EditAgentDrawerBody({
                 backendChoice={backendChoice}
                 pathMappings={pathMappings}
                 rootDirMode="edit"
+                disabled
                 onAddPathMapping={addPathMapping}
                 onRemovePathMapping={removePathMapping}
                 onUpdatePathMapping={updatePathMapping}
               />
+              <AgentTrajectoryField />
+              <ExpertComposerDefaultsFields />
               {!skillPackagesSupported ? (
                 <Alert
                   type="info"
@@ -989,68 +1013,83 @@ function EditAgentDrawerBody({
                               {t("experts.noSkillFiles")}
                             </div>
                           ) : (
-                            agentSkills.map((skill) => (
-                              <div
-                                key={skill.slug ?? skill.name}
-                                className={styles.fileItem}
-                              >
-                                <button
-                                  type="button"
-                                  className={styles.fileItemMain}
-                                  onClick={() =>
-                                    openFileEditor(
-                                      `/skills/${
-                                        skill.slug ?? skill.name
-                                      }/SKILL.md`,
-                                    )
-                                  }
-                                >
-                                  <div
-                                    className={styles.fileIcon}
-                                    style={{
-                                      color: "#059669",
-                                      background: "#0596691a",
-                                    }}
-                                  >
-                                    ⚡
-                                  </div>
-                                  <div className={styles.fileMeta}>
-                                    <div className={styles.fileLabel}>
-                                      {skillDisplayName(skill)}
-                                    </div>
-                                    <div className={styles.filePath}>
-                                      {skill.description || "SKILL.md"}
-                                    </div>
-                                  </div>
-                                  <span className={styles.fileHint}>
-                                    {t("experts.editFile")}
-                                  </span>
-                                </button>
-                                <Dropdown
-                                  menu={{
-                                    items: [
-                                      {
-                                        key: "delete",
-                                        label: t("common.delete"),
-                                        danger: true,
-                                        onClick: () =>
-                                          confirmDeleteSkill(skill),
-                                      },
-                                    ],
-                                  }}
-                                  trigger={["click"]}
+                            agentSkills.map((skill) => {
+                              const iconUrl = skill.icon_url?.trim();
+                              const label = skillDisplayName(skill);
+                              return (
+                                <div
+                                  key={skill.slug ?? skill.name}
+                                  className={styles.fileItem}
                                 >
                                   <button
                                     type="button"
-                                    className={styles.fileItemMenu}
-                                    aria-label={t("common.delete")}
-                                    onClick={(e) => e.stopPropagation()}
+                                    className={styles.fileItemMain}
+                                    onClick={() =>
+                                      openFileEditor(
+                                        `/skills/${
+                                          skill.slug ?? skill.name
+                                        }/SKILL.md`,
+                                      )
+                                    }
                                   >
-                                    <MoreHorizontal size={16} />
+                                    <div
+                                      className={styles.fileIcon}
+                                      style={{
+                                        color: "#8B5CF6",
+                                        background: iconUrl
+                                          ? "transparent"
+                                          : "#8B5CF61a",
+                                      }}
+                                    >
+                                      {iconUrl ? (
+                                        <img
+                                          src={iconUrl}
+                                          alt={label}
+                                          className={styles.fileIconImg}
+                                        />
+                                      ) : (
+                                        skill.emoji?.trim() ||
+                                        DEFAULT_SKILL_EMOJI
+                                      )}
+                                    </div>
+                                    <div className={styles.fileMeta}>
+                                      <div className={styles.fileLabel}>
+                                        {label}
+                                      </div>
+                                      <div className={styles.filePath}>
+                                        {skill.description || "SKILL.md"}
+                                      </div>
+                                    </div>
+                                    <span className={styles.fileHint}>
+                                      {t("experts.editFile")}
+                                    </span>
                                   </button>
-                                </Dropdown>
-                              </div>
-                            ))
+                                  <Dropdown
+                                    menu={{
+                                      items: [
+                                        {
+                                          key: "delete",
+                                          label: t("common.delete"),
+                                          danger: true,
+                                          onClick: () =>
+                                            confirmDeleteSkill(skill),
+                                        },
+                                      ],
+                                    }}
+                                    trigger={["click"]}
+                                  >
+                                    <button
+                                      type="button"
+                                      className={styles.fileItemMenu}
+                                      aria-label={t("common.delete")}
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      <MoreHorizontal size={16} />
+                                    </button>
+                                  </Dropdown>
+                                </div>
+                              );
+                            })
                           )}
                         </div>
                       </>

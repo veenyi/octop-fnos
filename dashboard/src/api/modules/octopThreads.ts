@@ -34,6 +34,11 @@ export interface OctopThreadHistory {
   has_more?: boolean;
   limit?: number;
   offset?: number;
+  next_cursor?: string | null;
+  /** Legacy checkpoint is being projected by the bounded background worker. */
+  history_loading?: boolean;
+  history_status?: "pending" | "queued" | "running" | "ready" | "failed";
+  history_retry_after_ms?: number;
   /** True while a turn is still streaming server-side for this thread. */
   turn_active?: boolean;
   /** Pending tool approval for this thread (survives page reload). */
@@ -69,6 +74,18 @@ export interface ContextUsageBreakdown {
   segments: ContextUsageSegment[];
 }
 
+export interface HistoryMigrationStatus {
+  remaining: number;
+  pending: number;
+  queued: number;
+  running: number;
+  failed: number;
+  processing: boolean;
+  agent_busy: boolean;
+  can_start: boolean;
+  accepted?: number;
+}
+
 export const CHAT_HISTORY_PAGE_SIZE = 25;
 
 export const octopThreadsApi = {
@@ -83,17 +100,30 @@ export const octopThreadsApi = {
       { method: "POST" },
     ),
 
+  historyMigrationStatus: (agentId: string) =>
+    request<HistoryMigrationStatus>(
+      `/agents/${encodeURIComponent(agentId)}/history-migration/status`,
+    ),
+
+  startHistoryMigration: (agentId: string) =>
+    request<HistoryMigrationStatus>(
+      `/agents/${encodeURIComponent(agentId)}/history-migration/start`,
+      { method: "POST" },
+    ),
+
   history: (
     agentId: string,
     threadId: string,
-    params: { limit?: number; offset?: number } = {},
+    params: { limit?: number; offset?: number; cursor?: string | null } = {},
   ) => {
     const limit = params.limit ?? CHAT_HISTORY_PAGE_SIZE;
     const offset = params.offset ?? 0;
     return request<OctopThreadHistory>(
       `/agents/${encodeURIComponent(agentId)}/threads/${encodeURIComponent(
         threadId,
-      )}/history?limit=${limit}&offset=${offset}`,
+      )}/history?limit=${limit}&offset=${offset}${
+        params.cursor ? `&cursor=${encodeURIComponent(params.cursor)}` : ""
+      }`,
     );
   },
 

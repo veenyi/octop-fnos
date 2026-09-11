@@ -1,14 +1,28 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applyQqChannelSaveConfig,
   DEFAULT_CHANNEL_DISPLAY_CONFIG,
   DEFAULT_QQ_GROUP_CONTEXT_CONFIG,
   normalizeQqGroupContextConfig,
 } from "./constants";
 
 describe("channel display defaults", () => {
-  it("uses invoke delivery for external IM channels", () => {
-    expect(DEFAULT_CHANNEL_DISPLAY_CONFIG.response_mode).toBe("invoke");
+  it("uses stream delivery for new external IM channels", () => {
+    expect(DEFAULT_CHANNEL_DISPLAY_CONFIG.response_mode).toBe("stream");
+    expect("c2c_streaming" in DEFAULT_CHANNEL_DISPLAY_CONFIG).toBe(false);
+  });
+});
+
+describe("applyQqChannelSaveConfig", () => {
+  it("only rewrites QQ delivery keys", () => {
+    const weixin = { response_mode: "invoke", show_progress: true };
+    applyQqChannelSaveConfig(weixin, "weixin");
+    expect(weixin).toEqual({ response_mode: "invoke", show_progress: true });
+
+    const qq = { streaming: false, show_progress: true, token: "t" };
+    applyQqChannelSaveConfig(qq, "qq");
+    expect(qq).toEqual({ token: "t", c2c_streaming: true });
   });
 });
 

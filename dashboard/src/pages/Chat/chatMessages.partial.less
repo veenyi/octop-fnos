@@ -8,6 +8,22 @@
   flex-direction: column;
 }
 
+/* Left gutter so the in-thread turn timeline ticks do not cover bubbles.
+   Prefer parent `.chatMainWithTurnRail` (title + composer + list). This local
+   class remains as a fallback when MessageList is mounted alone. */
+.messageListWrapperWithRail {
+  --chat-turn-rail-gutter: 48px;
+
+  .messageListInner {
+    padding-inline-start: var(--chat-turn-rail-gutter);
+    padding-inline-end: var(--chat-column-pad-x, 24px);
+
+    @media (max-width: 863px) {
+      padding-inline-start: var(--chat-column-pad-x, 24px);
+    }
+  }
+}
+
 .messageList {
   flex: 1;
   overflow-y: auto;
@@ -76,7 +92,11 @@
   pointer-events: auto;
 
   &:hover {
-    background: var(--fn-bg-hover);
+    background: color-mix(
+      in srgb,
+      var(--fn-color-brand) 8%,
+      var(--fn-bg-elevated, var(--fn-bg-primary))
+    );
     color: var(--fn-text-brand);
     border-color: color-mix(in srgb, var(--fn-color-brand) 55%, transparent);
     box-shadow:
@@ -180,6 +200,12 @@
   .messageBubble {
     margin-bottom: 0;
   }
+}
+
+.hitlSegment {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 /* Legacy grouped bubbles (kept for compatibility) */
@@ -646,36 +672,6 @@
   margin-top: 4px;
 }
 
-.hitlCard {
-  border: 1px solid var(--fn-border);
-  border-radius: 8px;
-  padding: 12px;
-  background: var(--fn-bg-elevated, var(--fn-bg-container));
-}
-
-.hitlTitle {
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-
-.hitlAction {
-  margin-bottom: 8px;
-}
-
-.hitlResolved {
-  margin-top: 4px;
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.hitlResolvedApproved {
-  color: var(--fn-color-success, #389e0d);
-}
-
-.hitlResolvedRejected {
-  color: var(--fn-color-error, #cf1322);
-}
-
 /* ---------- Assistant turn process summary (tools + thinking) ---------- */
 .processSummaryRow {
   display: block;
@@ -707,6 +703,104 @@
 .pinnedToolResultItem {
   min-width: 0;
   max-width: 100%;
+}
+
+.toolUiRendererWrap {
+  position: relative;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  /* Normal block flow: cards with maxWidth keep filling up to that cap;
+     cards with width:100% fill the message column. Do not use fit-content /
+     inline-grid here — those shrink to content width. */
+
+  .toolUiDockActions {
+    position: absolute;
+    z-index: 2;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+  }
+
+  &:hover .toolUiDockActions,
+  &:focus-within .toolUiDockActions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  @media (hover: none) {
+    .toolUiDockActions {
+      opacity: 1;
+      pointer-events: auto;
+    }
+  }
+}
+
+.toolUiDockBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--fn-border-secondary);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fn-bg-primary) 92%, transparent);
+  color: var(--fn-text-secondary);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+
+  &:hover {
+    color: var(--fn-color-brand);
+    border-color: color-mix(in srgb, var(--fn-color-brand) 38%, transparent);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--fn-color-brand);
+    outline-offset: 2px;
+  }
+}
+
+.toolUiDockPlaceholder {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border: 1px dashed var(--fn-border-secondary);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--fn-bg-secondary) 70%, transparent);
+  color: var(--fn-text-secondary);
+  text-align: left;
+  cursor: pointer;
+
+  &:hover {
+    border-color: color-mix(in srgb, var(--fn-color-brand) 38%, transparent);
+    color: var(--fn-color-brand);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--fn-color-brand);
+    outline-offset: 2px;
+  }
+}
+
+.toolUiDockPlaceholderTitle {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fn-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolUiDockPlaceholderHint {
+  font-size: 12px;
+  color: var(--fn-text-tertiary);
+  flex-shrink: 0;
 }
 
 .assistantTurnAnswer {
@@ -758,12 +852,17 @@
 }
 
 .knowledgeCitationName {
+  min-width: 0;
+  max-width: 14rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .knowledgeCitationKb {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 8rem;
   color: var(--fn-text-tertiary);
   overflow: hidden;
   text-overflow: ellipsis;

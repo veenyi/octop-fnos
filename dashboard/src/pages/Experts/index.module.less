@@ -125,28 +125,7 @@
   min-width: 0;
 }
 
-.agentCard2NameActions {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  flex-shrink: 0;
-  opacity: 1;
-}
-
-@media (hover: hover) {
-  .agentCard2NameActions {
-    opacity: 1;
-    transition: opacity 0.15s;
-  }
-
-  .agentCardIdRow:hover .agentCard2NameActions,
-  .agentCardIdRow:focus-within .agentCard2NameActions {
-    opacity: 1;
-  }
-}
-
-.agentCard2NameActionBtn,
-.agentCard2NameDelBtn {
+.agentCard2NameActionBtn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -164,10 +143,6 @@
     color: var(--fn-text-secondary);
     background: var(--fn-sidebar-item-hover);
   }
-}
-
-.agentCard2NameDelBtn:hover {
-  color: #ff4d4f;
 }
 
 .agentCardIdRow {
@@ -394,6 +369,7 @@
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  overflow: hidden;
 }
 
 .agentCardTitleBlock {
@@ -512,6 +488,13 @@
   align-items: center;
   gap: 4px;
   min-width: 0;
+}
+
+.tableStateMain {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .tableErrorWrap {
@@ -1668,6 +1651,16 @@
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  overflow: hidden;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.fileIconImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 
 .fileMeta {
@@ -1739,6 +1732,14 @@
 
 .expertsTable {
   margin: 12px 0 0;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+
+  :global(.octop-table-wrapper),
+  :global(.ant-table-wrapper) {
+    max-width: 100%;
+  }
 
   :global(.octop-table-pagination) {
     margin: 12px 0 0 !important;

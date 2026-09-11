@@ -55,6 +55,7 @@ import styles from "./ToolsPanel.module.less";
 const CATEGORY_ORDER = [
   "filesystem",
   "orchestration",
+  "interaction",
   "web",
   "media",
   "memory",
@@ -63,13 +64,13 @@ const CATEGORY_ORDER = [
   "mobile",
   "teams",
   "misc",
-  "plugin",
 ] as const;
 
 /** Icon square fill per category. */
 const CATEGORY_ACCENT: Record<string, string> = {
   filesystem: "#3B82F6",
   orchestration: "#8B5CF6",
+  interaction: "#14B8A6",
   web: "#22C55E",
   media: "#EC4899",
   memory: "#F59E0B",
@@ -78,7 +79,6 @@ const CATEGORY_ACCENT: Record<string, string> = {
   mobile: "#0EA5E9",
   teams: "#F97316",
   misc: "#64748B",
-  plugin: "#A855F7",
 };
 
 const TOOL_ICONS: Record<string, LucideIcon> = {
@@ -140,8 +140,7 @@ interface ToolsPanelProps {
 }
 
 /**
- * Full tools surface (builtin + plugin), shared by Personalization tab and
- * Experts ToolCatalogDrawer — mirrors SkillsTabs.
+ * Built-in tools surface shared by Personalization and Experts.
  */
 export default function ToolsPanel({ agentId }: ToolsPanelProps) {
   const { t } = useTranslation();
@@ -159,9 +158,12 @@ export default function ToolsPanel({ agentId }: ToolsPanelProps) {
     setLoading(true);
     try {
       const res = await agentToolsApi.get(agentId);
-      setTools(res.tools);
+      const builtinTools = res.tools.filter(
+        (tool) => tool.source === "builtin",
+      );
+      setTools(builtinTools);
       const next: Record<string, boolean> = {};
-      for (const tool of res.tools) {
+      for (const tool of builtinTools) {
         next[toolKey(tool)] = tool.enabled;
       }
       setEnabledMap(next);

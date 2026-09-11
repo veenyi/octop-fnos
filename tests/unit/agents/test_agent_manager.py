@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
@@ -23,9 +24,15 @@ from octop.infra.db.services import build_shared_services
 from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.utils.paths import PathLayout
 
-# Rootfs-absolute workspace paths (e.g. /.octop/workspaces/<id>) are a
-# Linux/Docker sandbox concept; on Windows they are not absolute paths.
-posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX rootfs workspace paths")
+# Real HarnessAgentManager starts memory maintenance (GC/vacuum) on a daemon
+# thread. Closing the agent while that tick holds the SQLite handle races on
+# Windows (access violation under pytest-xdist). Unit tests here only need
+# workspace/config behavior — keep memory off.
+_MEMORY_OFF: dict[str, Any] = {"memory": {"memory_enabled": False}}
+
+
+async def _collect_async(iterator: AsyncIterator[Any]) -> list[Any]:
+    return [item async for item in iterator]
 
 
 def _expected_default_backend(manager: AgentManager, agent_id: str) -> dict[str, Any]:
@@ -203,7 +210,18 @@ def test_build_harness_config_includes_cronjob_tools_when_cron_manager_set(
 
     gw = MagicMock()
     gw.thread_registry = MagicMock()
-    cron_mgr = CronManager(gateway=gw, repos=manager._repos, timezone="UTC")
+    from octop.infra.cron.delivery import CronDeliveryService
+
+    cron_mgr = CronManager(
+        gateway=gw,
+        delivery_service=CronDeliveryService(
+            gateway=gw,
+            agent_manager=manager,
+            repos=manager._repos,
+        ),
+        repos=manager._repos,
+        timezone="UTC",
+    )
     cron_mgr._scheduler = MagicMock()
     manager.set_cron_manager(cron_mgr)
 
@@ -240,7 +258,17 @@ def test_build_harness_config_defaults_local_shell_backend(manager: AgentManager
     assert cfg.bootstrap_enabled is True
     # Kept for harness FilesystemGuardMiddleware (not passed to deepagents).
     assert cfg.permissions is not None
-    assert cfg.log_dir == str(manager.paths.logs_dir)
+
+
+@pytest.mark.asyncio
+async def test_boot_passes_process_log_dir_to_harness_manager(manager: AgentManager) -> None:
+    await manager.boot()
+    try:
+        hm = manager._harness_manager
+        assert hm is not None
+        assert hm._log_dir == manager.paths.logs_dir.resolve()
+    finally:
+        await manager.shutdown()
 
 
 def test_build_harness_config_enables_bootstrap_for_expert_template(manager: AgentManager) -> None:
@@ -428,6 +456,70 @@ async def test_stream_applies_bootstrap_refresh_after_turn(manager: AgentManager
     assert chunks == [{"type": "token", "content": "hi"}]
     agent._init_graph.assert_called_once()
     assert agent_id not in manager._bootstrap_graph_refresh_pending
+
+
+@pytest.mark.asyncio
+async def test_history_backfill_refuses_while_agent_stream_is_active(
+    manager: AgentManager,
+) -> None:
+    agent_id = "AGT_BUSY"
+    started = asyncio.Event()
+    release = asyncio.Event()
+    harness_manager = MagicMock()
+
+    async def fake_stream(*_args: Any, **_kwargs: Any) -> AsyncIterator[dict[str, str]]:
+        started.set()
+        await release.wait()
+        yield {"type": "done"}
+
+    harness_manager.stream = fake_stream
+    manager._harness_manager = harness_manager
+
+    task = asyncio.create_task(_collect_async(manager.stream(agent_id, {"thread_id": "thr-busy"})))
+    await started.wait()
+
+    assert manager.is_agent_active(agent_id) is True
+    assert manager.try_begin_history_backfill(agent_id) is False
+
+    release.set()
+    await task
+    assert manager.is_agent_active(agent_id) is False
+
+
+@pytest.mark.asyncio
+async def test_waiting_agent_stream_prevents_next_history_backfill(
+    manager: AgentManager,
+) -> None:
+    agent_id = "AGT_PRIORITY"
+    stream_started = asyncio.Event()
+    stream_release = asyncio.Event()
+    harness_manager = MagicMock()
+
+    async def fake_stream(*_args: Any, **_kwargs: Any) -> AsyncIterator[dict[str, str]]:
+        stream_started.set()
+        await stream_release.wait()
+        yield {"type": "done"}
+
+    harness_manager.stream = fake_stream
+    manager._harness_manager = harness_manager
+    assert manager.try_begin_history_backfill(agent_id) is True
+
+    task = asyncio.create_task(
+        _collect_async(manager.stream(agent_id, {"thread_id": "thr-priority"}))
+    )
+    await asyncio.sleep(0)
+    assert stream_started.is_set() is False
+    assert manager.try_begin_history_backfill(agent_id) is False
+
+    manager.end_history_backfill(agent_id)
+    await stream_started.wait()
+    assert manager.is_agent_active(agent_id) is True
+    assert manager.try_begin_history_backfill(agent_id) is False
+
+    stream_release.set()
+    await task
+    assert manager.try_begin_history_backfill(agent_id) is True
+    manager.end_history_backfill(agent_id)
 
 
 @pytest.mark.asyncio
@@ -705,8 +797,14 @@ async def test_start_agent_real_harness_seeds_agents_md(manager: AgentManager) -
     _seed_test_provider(manager)
     manager._harness_manager = HarnessAgentManager(
         providers=manager.providers.build_harness_configs(),
+        log_dir=str(manager.paths.logs_dir),
     )
-    row = manager._repos.agent_repo.create(agent_id="REAL01", user_id=None, name="real")
+    row = manager._repos.agent_repo.create(
+        agent_id="REAL01",
+        user_id=None,
+        name="real",
+        config_json=json.dumps(_MEMORY_OFF),
+    )
     row = manager._repos.agent_repo.get("REAL01")
     assert row is not None
 
@@ -730,8 +828,14 @@ async def test_stop_and_start_round_trip(manager: AgentManager) -> None:
     _seed_test_provider(manager)
     manager._harness_manager = HarnessAgentManager(
         providers=manager.providers.build_harness_configs(),
+        log_dir=str(manager.paths.logs_dir),
     )
-    manager._repos.agent_repo.create(agent_id="STOP01", user_id=None, name="stop-me")
+    manager._repos.agent_repo.create(
+        agent_id="STOP01",
+        user_id=None,
+        name="stop-me",
+        config_json=json.dumps(_MEMORY_OFF),
+    )
     row = manager.get_row("STOP01")
     assert row is not None
     await manager._start_agent(row)
@@ -760,8 +864,14 @@ async def test_save_security_rebuilds_running_harness_agent(manager: AgentManage
     _seed_test_provider(manager)
     manager._harness_manager = HarnessAgentManager(
         providers=manager.providers.build_harness_configs(),
+        log_dir=str(manager.paths.logs_dir),
     )
-    manager._repos.agent_repo.create(agent_id="SEC01", user_id=None, name="sec")
+    manager._repos.agent_repo.create(
+        agent_id="SEC01",
+        user_id=None,
+        name="sec",
+        config_json=json.dumps(_MEMORY_OFF),
+    )
     row = manager.get_row("SEC01")
     assert row is not None
     await manager._start_agent(row)
@@ -783,8 +893,14 @@ async def test_reload_skips_stopped_agent(manager: AgentManager) -> None:
     _seed_test_provider(manager)
     manager._harness_manager = HarnessAgentManager(
         providers=manager.providers.build_harness_configs(),
+        log_dir=str(manager.paths.logs_dir),
     )
-    manager._repos.agent_repo.create(agent_id="SKIP01", user_id=None, name="skip")
+    manager._repos.agent_repo.create(
+        agent_id="SKIP01",
+        user_id=None,
+        name="skip",
+        config_json=json.dumps(_MEMORY_OFF),
+    )
     row = manager.get_row("SKIP01")
     assert row is not None
     await manager._start_agent(row)
@@ -810,8 +926,9 @@ async def test_create_seeds_bootstrap_files(manager: AgentManager) -> None:
     _seed_test_provider(manager)
     manager._harness_manager = HarnessAgentManager(
         providers=manager.providers.build_harness_configs(),
+        log_dir=str(manager.paths.logs_dir),
     )
-    row = await manager.create(AgentCreateSpec(name="seeded"))
+    row = await manager.create(AgentCreateSpec(name="seeded", config=dict(_MEMORY_OFF)))
     agent = manager.get_agent(row.agent_id)
     assert agent.workspace.exists("BOOTSTRAP.md")
     assert agent.workspace.exists("AGENTS.md")
@@ -843,6 +960,7 @@ async def test_create_keeps_user_workspace_dir(
     _seed_test_provider(manager)
     manager._harness_manager = HarnessAgentManager(
         providers=manager.providers.build_harness_configs(),
+        log_dir=str(manager.paths.logs_dir),
     )
     custom = tmp_path / "custom-user-ws"
     try:
@@ -850,6 +968,7 @@ async def test_create_keeps_user_workspace_dir(
             AgentCreateSpec(
                 name="user-ws",
                 config={
+                    **_MEMORY_OFF,
                     "backend": {
                         "type": "local_shell",
                         "root_dir": str(tmp_path),
@@ -868,7 +987,6 @@ async def test_create_keeps_user_workspace_dir(
 
 
 @pytest.mark.asyncio
-@posix_only
 async def test_create_persists_rootfs_workspace_under_scoped_root(
     manager: AgentManager,
     tmp_path: Path,
@@ -881,6 +999,7 @@ async def test_create_persists_rootfs_workspace_under_scoped_root(
     _seed_test_provider(manager)
     manager._harness_manager = HarnessAgentManager(
         providers=manager.providers.build_harness_configs(),
+        log_dir=str(manager.paths.logs_dir),
     )
     try:
         # manager fixture uses ``{tmp_path}/.octop`` as OCTOP_HOME, so scoping
@@ -889,11 +1008,12 @@ async def test_create_persists_rootfs_workspace_under_scoped_root(
             AgentCreateSpec(
                 name="scoped-ws",
                 config={
+                    **_MEMORY_OFF,
                     "backend": {
                         "type": "local_shell",
                         "root_dir": str(tmp_path),
                         "virtual_mode": True,
-                    }
+                    },
                 },
             )
         )
@@ -904,8 +1024,12 @@ async def test_create_persists_rootfs_workspace_under_scoped_root(
         assert host.is_dir()
         assert (host / "AGENTS.md").is_file()
         harness_cfg = manager._build_harness_config(row)
-        # Harness receives the persisted agent-facing path — not the host join.
-        assert Path(harness_cfg.workspace_dir) == Path(f"/.octop/workspaces/{row.agent_id}")
+        # POSIX hands harness the persisted agent-facing path — not the host join.
+        # Windows cannot express it as absolute, so harness gets the host mapping.
+        expected_harness_ws = (
+            Path(f"/.octop/workspaces/{row.agent_id}") if os.name == "posix" else host
+        )
+        assert Path(harness_cfg.workspace_dir) == expected_harness_ws
         assert not (tmp_path / ".octop" / "agents" / row.agent_id).exists()
     finally:
         manager._harness_manager.close()
@@ -952,9 +1076,14 @@ async def test_templated_agent_keeps_expert_soul_on_reload(manager: AgentManager
     _seed_test_provider(manager)
     manager._harness_manager = HarnessAgentManager(
         providers=manager.providers.build_harness_configs(),
+        log_dir=str(manager.paths.logs_dir),
     )
     row = await manager.create(
-        AgentCreateSpec(name="tpl-bot", template_name="general-assistant"),
+        AgentCreateSpec(
+            name="tpl-bot",
+            template_name="general-assistant",
+            config=dict(_MEMORY_OFF),
+        ),
     )
     agent = manager.get_agent(row.agent_id)
     expected_soul = (default_library_root() / "general-assistant" / "SOUL.md").read_text(
@@ -1301,3 +1430,87 @@ def test_prepare_stream_request_maps_model_settings_and_max_input_tokens(
         "max_tokens": 2048,
     }
     assert req["configurable"]["max_input_tokens"] == 32000
+
+
+def test_peer_manifest_metadata_missing_file(manager: AgentManager) -> None:
+    manager._repos.agent_repo.create(agent_id="AGT1", user_id=None, name="demo")
+    assert manager._peer_manifest_metadata("AGT1", None) == {}
+
+
+def test_peer_manifest_metadata_bad_json(manager: AgentManager) -> None:
+    manager._repos.agent_repo.create(agent_id="AGT1", user_id=None, name="demo")
+    ws = manager._paths.ensure_agent_workspace("AGT1")
+    (ws / ".octop").mkdir(parents=True, exist_ok=True)
+    (ws / ".octop" / "manifest.json").write_text("{", encoding="utf-8")
+    assert manager._peer_manifest_metadata("AGT1", "row") == {}
+
+
+def test_peer_manifest_metadata_reads_cards(manager: AgentManager) -> None:
+    manager._repos.agent_repo.create(
+        agent_id="AGT1", user_id=None, name="demo", description="from-db"
+    )
+    ws = manager._paths.ensure_agent_workspace("AGT1")
+    (ws / ".octop").mkdir(parents=True, exist_ok=True)
+    (ws / ".octop" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "description": {"zh": "manifest-only", "en": "manifest-only"},
+                "quick_prompts": [
+                    {
+                        "title": {"zh": "画图", "en": "Plot"},
+                        "description": {"zh": "说明", "en": "Hint"},
+                        "prompt": {"zh": "机密", "en": "secret"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    extra = manager._peer_manifest_metadata("AGT1", "from-db")
+    assert extra["quick_prompts"][0]["title"]["zh"] == "画图"
+    assert "description" not in extra
+
+
+def test_refresh_peer_entry_picks_up_manifest_edits(manager: AgentManager) -> None:
+    manager._repos.agent_repo.create(
+        agent_id="AGT1", user_id=None, name="demo", description="from-db"
+    )
+    ws = manager._paths.ensure_agent_workspace("AGT1")
+    (ws / ".octop").mkdir(parents=True, exist_ok=True)
+    (ws / ".octop" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "quick_prompts": [
+                    {
+                        "title": {"zh": "新卡", "en": "New"},
+                        "description": {"zh": "说明", "en": "Hint"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    entry = MagicMock()
+    entry.agent_id = "AGT1"
+    entry.metadata = {
+        "description": "stale",
+        "quick_prompts": [{"title": "old"}],
+    }
+    manager._refresh_peer_entry(entry)
+    assert entry.metadata["description"] == "from-db"
+    assert entry.metadata["quick_prompts"][0]["title"]["zh"] == "新卡"
+
+
+def test_refresh_peer_entry_clears_empty_cards(manager: AgentManager) -> None:
+    manager._repos.agent_repo.create(agent_id="AGT1", user_id=None, name="demo")
+    ws = manager._paths.ensure_agent_workspace("AGT1")
+    (ws / ".octop").mkdir(parents=True, exist_ok=True)
+    (ws / ".octop" / "manifest.json").write_text(
+        json.dumps({"quick_prompts": []}),
+        encoding="utf-8",
+    )
+    entry = MagicMock()
+    entry.agent_id = "AGT1"
+    entry.metadata = {"quick_prompts": [{"title": "old"}]}
+    manager._refresh_peer_entry(entry)
+    assert "quick_prompts" not in entry.metadata

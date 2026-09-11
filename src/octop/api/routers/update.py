@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import time
 from typing import Any
 
@@ -25,6 +27,7 @@ from octop.infra.setup.self_update import (
     fetch_pypi_info,
     get_editable_path,
     get_local_version,
+    green_packages_dir,
     is_newer,
     parse_changelog_for_version,
     run_upgrade,
@@ -46,11 +49,16 @@ def _build_status(
     *,
     latest: str | None = None,
     error: str | None = None,
+    error_code: str | None = None,
+    source: str | None = None,
     release_notes: str | None = None,
 ) -> dict[str, Any]:
     current = get_local_version()
     if latest is None and error is None:
-        latest = fetch_latest_pypi_version()
+        info = fetch_pypi_info()
+        if info is not None:
+            latest = info.version
+            source = info.source
     has_update = bool(latest and is_newer(latest, current))
     payload = {
         "current_version": current,
@@ -58,7 +66,10 @@ def _build_status(
         "has_update": has_update,
         "is_editable": get_editable_path() is not None,
         "service_mode": detect_service_mode(),
+        "desktop": _is_desktop_process(),
         "error": error,
+        "error_code": error_code if error else None,
+        "source": source if latest is not None else None,
         "last_check_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "release_notes": release_notes if has_update else None,
     }
@@ -79,16 +90,47 @@ async def update_status(_: Any = Depends(current_user)) -> dict[str, Any]:
 async def check_for_updates(_: Any = Depends(require_permission("update"))) -> dict[str, Any]:
     pypi_info = await asyncio.to_thread(fetch_pypi_info)
     if pypi_info is None:
-        return await asyncio.to_thread(_build_status, latest=None, error="could not reach PyPI")
+        return await asyncio.to_thread(
+            _build_status,
+            latest=None,
+            error="could not reach PyPI",
+            error_code="pypi_unreachable",
+        )
     release_notes = parse_changelog_for_version(pypi_info.description, pypi_info.version)
     return await asyncio.to_thread(
-        _build_status, latest=pypi_info.version, release_notes=release_notes
+        _build_status,
+        latest=pypi_info.version,
+        source=pypi_info.source,
+        release_notes=release_notes,
     )
 
 
 async def _upgrade_worker(task_id: str) -> None:
     await update_task(task_id, stage="downloading", percent=20)
-    result: UpgradeResult = await asyncio.to_thread(run_upgrade, verbose=False)
+    upgrade_task = asyncio.create_task(asyncio.to_thread(run_upgrade, verbose=False))
+    percent = 20
+    try:
+        while True:
+            try:
+                result: UpgradeResult = await asyncio.wait_for(
+                    asyncio.shield(upgrade_task),
+                    timeout=5,
+                )
+                break
+            except TimeoutError:
+                percent = min(percent + 5, 85)
+                await update_task(task_id, stage="installing", percent=percent)
+    except Exception as exc:
+        logger.exception("upgrade task %s failed unexpectedly", task_id)
+        await update_task(
+            task_id,
+            status=UpgradeTaskStatus.ERROR,
+            stage="error",
+            percent=None,
+            success=False,
+            error=str(exc) or type(exc).__name__,
+        )
+        return
     mirror_errors = result.mirror_errors or None
     if not result.success:
         await update_task(
@@ -146,6 +188,19 @@ async def upgrade_progress(
     }
 
 
+def _is_desktop_process() -> bool:
+    if green_packages_dir() is not None:
+        return True
+    raw = (os.environ.get("OCTOP_DESKTOP") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _restart_desktop_process() -> None:
+    time.sleep(0.4)
+    argv = list(getattr(sys, "orig_argv", None) or [sys.executable, *sys.argv])
+    os.execv(argv[0], argv)
+
+
 def _restart_service_task(runtime: ServiceRuntime) -> None:
     try:
         restart_service(runtime)
@@ -158,6 +213,9 @@ async def restart_service_endpoint(
     background_tasks: BackgroundTasks,
     _: Any = Depends(require_permission("update")),
 ) -> dict[str, Any]:
+    if _is_desktop_process():
+        background_tasks.add_task(_restart_desktop_process)
+        return {"status": "restarting", "service_mode": "desktop"}
     mode = detect_service_mode()
     if mode is None:
         raise OctopError(

@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any
 
 from harness_agent.config import ModelConfig, ProviderConfig
 
-from octop.infra.agents.providers.model_flags import is_chat_eligible_model
+from octop.infra.agents.providers.model_flags import is_chat_eligible_model, is_vision_model
+from octop.infra.agents.providers.opencode_session import (
+    OPENCODE_SESSION_HEADER,
+    is_opencode_go_base_url,
+)
 from octop.infra.agents.providers.reasoning import reasoning_capability
 
 if TYPE_CHECKING:
@@ -48,10 +52,7 @@ def _infer_model_input_modalities(
 
 
 def _model_dict_supports_image(model: dict[str, Any]) -> bool:
-    model_id = str(model.get("id") or "")
-    raw = model.get("input")
-    explicit = list(raw) if isinstance(raw, list) else None
-    return "image" in _infer_model_input_modalities(model_id, explicit)
+    return is_vision_model(model)
 
 
 def enabled_model_refs(
@@ -159,6 +160,9 @@ class ProviderStore:
                     name=row.name,
                     models=models,
                     headers=headers,
+                    session_header=(
+                        OPENCODE_SESSION_HEADER if is_opencode_go_base_url(row.base_url) else None
+                    ),
                 )
             )
         return out

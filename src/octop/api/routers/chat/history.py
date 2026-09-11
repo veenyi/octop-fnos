@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +15,9 @@ from octop.api.deps import current_user, get_server
 from octop.api.routers.chat.models import ForkThreadBody, RebindSessionBody, RenameThreadBody
 from octop.api.routers.chat.serialize import (
     HISTORY_DEFAULT_LIMIT,
+    _backfill_thread_projection,
     _clamp_history_limit,
-    _load_thread_messages,
+    _load_projected_thread_messages,
 )
 from octop.infra.agents.context_breakdown import SEGMENT_KEYS, compute_context_breakdown
 from octop.infra.agents.middleware.thread_artifacts import artifacts_for_response
@@ -23,9 +26,46 @@ from octop.infra.agents.workspace_dir import agent_facing_workspace_dir_from_con
 from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.gateway.hitl.coordinator import pending_hitl_payload
 from octop.infra.gateway.threads import ThreadRegistry, thread_row_has_messages
+from octop.infra.history.service import HistoryArchive
+from octop.infra.trajectory.service import TrajectoryService
 from octop.infra.utils.locale import resolve_request_locale
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _agent_is_busy(server: Any, agent_id: str) -> bool:
+    checker = getattr(server.app_runtime.agent_registry, "is_agent_active", None)
+    return callable(checker) and checker(agent_id) is True
+
+
+def _history_migration_payload(server: Any, *, agent_id: str, user_id: int) -> dict[str, Any]:
+    repo = server.services.thread_message_repo
+    summary = repo.migration_summary(
+        agent_id=agent_id,
+        user_id=user_id,
+    )
+    queue = server.app_runtime.gateway.history_backfill
+    processing = any(
+        queue.contains(thread_id)
+        for thread_id in repo.migration_active_thread_ids(agent_id=agent_id, user_id=user_id)
+    )
+    agent_busy = _agent_is_busy(server, agent_id)
+    return {
+        "remaining": summary.remaining,
+        "pending": summary.pending,
+        "queued": summary.queued,
+        "running": summary.running,
+        "failed": summary.failed,
+        "processing": processing,
+        "agent_busy": agent_busy,
+        "can_start": (
+            not isinstance(getattr(server.app_runtime, "history_archive", None), HistoryArchive)
+            and summary.remaining > 0
+            and queue.available_slots > 0
+            and not agent_busy
+        ),
+    }
 
 
 def _agent_facing_workspace_dir(server: Any, agent_id: str) -> Path:
@@ -86,6 +126,76 @@ async def list_threads(
         }
         for r in rows
     ]
+
+
+@router.get(
+    "/agents/{agent_id}/history-migration/status",
+    summary="Legacy history migration status",
+)
+async def get_history_migration_status(
+    agent_id: str,
+    as_user: int | None = None,
+    user: Any = Depends(current_user),
+    server: Any = Depends(get_server),
+) -> dict[str, Any]:
+    """Report old conversations awaiting the v10 dashboard history projection."""
+    require_agent_row(agent_id, user=user, as_user=as_user, server=server)
+    effective_uid = as_user if as_user is not None else user.id
+    return _history_migration_payload(server, agent_id=agent_id, user_id=effective_uid)
+
+
+@router.post(
+    "/agents/{agent_id}/history-migration/start",
+    summary="Start legacy history migration",
+)
+async def start_history_migration(
+    agent_id: str,
+    as_user: int | None = None,
+    user: Any = Depends(current_user),
+    server: Any = Depends(get_server),
+) -> dict[str, Any]:
+    """Queue a bounded batch; the gateway decodes exactly one checkpoint at a time."""
+    require_agent_row(agent_id, user=user, as_user=as_user, server=server)
+    # Fail before changing persisted states when this agent is not actually available.
+    server.app_runtime.agent_registry.get_agent(agent_id)
+    effective_uid = as_user if as_user is not None else user.id
+    if isinstance(
+        getattr(server.app_runtime, "history_archive", None), HistoryArchive
+    ) or _agent_is_busy(server, agent_id):
+        return {
+            **_history_migration_payload(server, agent_id=agent_id, user_id=effective_uid),
+            "accepted": 0,
+        }
+    queue = server.app_runtime.gateway.history_backfill
+    repo = server.services.thread_message_repo
+    candidate_limit = queue.available_slots + queue.active_jobs
+    candidates = repo.migration_candidates(
+        agent_id=agent_id,
+        user_id=effective_uid,
+        limit=candidate_limit,
+    )
+    accepted = 0
+    for candidate in candidates:
+        if queue.contains(candidate.thread_id):
+            continue
+
+        async def _work(thread_id: str = candidate.thread_id) -> None:
+            await _backfill_thread_projection(
+                server,
+                agent_id,
+                thread_id,
+                user=user,
+            )
+
+        if not queue.enqueue(candidate.thread_id, _work):
+            break
+        if candidate.status != "running":
+            repo.mark_projection(candidate.thread_id, "queued")
+        accepted += 1
+    return {
+        **_history_migration_payload(server, agent_id=agent_id, user_id=effective_uid),
+        "accepted": accepted,
+    }
 
 
 @router.post("/agents/{agent_id}/threads", status_code=201, summary="New thread")
@@ -162,6 +272,7 @@ async def get_thread_history(
     thread_id: str,
     limit: int = HISTORY_DEFAULT_LIMIT,
     offset: int = 0,
+    cursor: str | None = None,
     as_user: int | None = None,
     user: Any = Depends(current_user),
     server: Any = Depends(get_server),
@@ -175,14 +286,75 @@ async def get_thread_history(
     row = _require_thread(server, agent_id, thread_id, user, as_user)
     page_limit = _clamp_history_limit(limit)
     page_offset = max(0, offset)
-    messages, has_more = await _load_thread_messages(
-        server,
-        agent_id,
-        thread_id,
-        page_limit,
-        offset=page_offset,
-        user=user,
+    from langchain_core.messages import messages_from_dict  # noqa: PLC0415
+
+    from octop.api.routers.chat.serialize import (  # noqa: PLC0415
+        _enrich_history_tool_media,
+        _serialize_history_message,
     )
+    from octop.infra.history.reader import read_page  # noqa: PLC0415
+
+    archive = getattr(server.app_runtime, "history_archive", None)
+    next_cursor = None
+    if isinstance(archive, HistoryArchive):
+        page = await read_page(
+            archive,
+            server.app_runtime.agent_registry,
+            agent_id,
+            thread_id,
+            limit=page_limit,
+            offset=page_offset,
+            cursor=cursor,
+        )
+        has_more, next_cursor = page["has_more"], page["next_cursor"]
+        messages = []
+        for message in messages_from_dict(page["messages"]):
+            item = _serialize_history_message(message, user=user)
+            if item is None:
+                raise ValueError("An archived history message could not be rendered")
+            messages.append(item)
+        messages = _enrich_history_tool_media(messages, agent_id=agent_id)
+        history_loading = False
+        projection_status = "ready"
+    else:
+        projection_repo = server.services.thread_message_repo
+        projection_status = projection_repo.projection_status(thread_id)
+        history_loading = projection_status != "ready"
+        if history_loading:
+
+            async def _work() -> None:
+                await _backfill_thread_projection(
+                    server,
+                    agent_id,
+                    thread_id,
+                    user=user,
+                )
+
+            accepted = (
+                False
+                if _agent_is_busy(server, agent_id)
+                else server.app_runtime.gateway.history_backfill.enqueue(thread_id, _work)
+            )
+            if accepted and projection_status not in ("queued", "running"):
+                projection_repo.mark_projection(thread_id, "queued")
+            messages = []
+            has_more = False
+            projection_status = (
+                projection_status
+                if accepted and projection_status in ("queued", "running")
+                else "queued"
+                if accepted
+                else "pending"
+            )
+        else:
+            messages, has_more = _load_projected_thread_messages(
+                server,
+                agent_id,
+                thread_id,
+                page_limit,
+                offset=page_offset,
+                user=user,
+            )
     effective_uid = as_user if as_user is not None else user.id
     hitl_pending = pending_hitl_payload(
         server.app_runtime.gateway.processor.hitl_coordinator.store,
@@ -197,6 +369,10 @@ async def get_thread_history(
         "has_more": has_more,
         "limit": page_limit,
         "offset": page_offset,
+        "next_cursor": next_cursor,
+        "history_loading": history_loading,
+        "history_status": projection_status,
+        "history_retry_after_ms": 1500 if history_loading else 0,
         "turn_active": server.app_runtime.gateway.ws_hub.is_turn_active(thread_id),
         "hitl_pending": hitl_pending,
         "artifacts": artifacts_for_response(row.artifacts, workspace_dir),
@@ -256,6 +432,8 @@ async def fork_thread(
         content=body.content,
         assistant_turns_from_end=body.assistant_turns_from_end,
         locale=resolve_request_locale(request),
+        thread_message_repo=server.services.thread_message_repo,
+        history_archive=getattr(server.app_runtime, "history_archive", None),
     )
 
 
@@ -273,6 +451,41 @@ async def rebind_session(
         session_key=sk, thread_id=body.thread_id, agent_id=agent_id
     )
     return {"session_key": sk, "thread_id": body.thread_id}
+
+
+@router.get(
+    "/agents/{agent_id}/threads/{thread_id}/history/export",
+    summary="Export unrendered conversation history",
+    description="Read-only JSON export of legacy and versioned messages with archive turn status.",
+)
+async def export_history(
+    thread_id: str,
+    agent_id: str,
+    as_user: int | None = None,
+    user: Any = Depends(current_user),
+    server: Any = Depends(get_server),
+) -> Any:
+    from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+    from octop.infra.history.reader import export_messages  # noqa: PLC0415
+
+    _require_thread(server, agent_id, thread_id, user, as_user)
+    archive = getattr(server.app_runtime, "history_archive", None)
+    if not isinstance(archive, HistoryArchive):
+        raise OctopError(ErrorCode.NOT_FOUND, "Versioned history is not enabled")
+
+    messages = await export_messages(
+        archive, server.app_runtime.agent_registry, agent_id, thread_id
+    )
+    return JSONResponse(
+        {
+            "format": "octop-history-v2",
+            "thread_id": thread_id,
+            "messages": messages,
+            "latest_turn": await asyncio.to_thread(archive.store.turn, thread_id),
+        },
+        headers={"Content-Disposition": 'attachment; filename="history.json"'},
+    )
 
 
 @router.patch("/agents/{agent_id}/threads/{thread_id}", summary="Update thread")
@@ -359,3 +572,10 @@ async def delete_thread(
     _require_thread(server, agent_id, thread_id, user, as_user)
     await server.app_runtime.agent_registry.delete_thread_checkpoint(agent_id, thread_id)
     server.app_runtime.gateway.thread_registry.delete_thread(thread_id)
+    runtime = getattr(server, "app_runtime", None)
+    trajectory = getattr(runtime, "trajectory_service", None) if runtime is not None else None
+    if isinstance(trajectory, TrajectoryService):
+        try:
+            trajectory.delete_for_thread(thread_id)
+        except Exception:
+            logger.exception("trajectory cascade delete failed thread=%s", thread_id)

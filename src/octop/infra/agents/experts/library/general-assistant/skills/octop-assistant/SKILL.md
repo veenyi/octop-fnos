@@ -1,5 +1,5 @@
 ---
-name: octop_assistant
+name: octop-assistant
 description: >-
   帮助用户配置和管理 Octop 自身。当用户提出以下类型的问题时使用此 skill：
   配置或切换 LLM 模型与 Provider；添加或管理 IM 通道（飞书、企业微信、QQ 等）；
@@ -10,6 +10,12 @@ metadata:
   octop:
     emoji: "⚙️"
     requires: {}
+    label:
+      zh: "Octop 配置助手"
+      en: "Octop Assistant"
+    summary:
+      zh: "通过 CLI 配置模型、通道、Skill、定时任务，以及备份与升级。"
+      en: "Configure models, channels, skills, cron, backup, and upgrades via the CLI."
 ---
 
 # Octop Assistant ⚙️

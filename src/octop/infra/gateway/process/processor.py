@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from harness_agent.slash import SlashSink, parse_slash
+from harness_agent.slash import SlashSink
 from harness_agent.teams.inbox import InboxMessage
 from harness_agent.teams.processor import ReplyEvent, default_compose_followup
+from harness_agent.teams.util import PeerCall, PeerSession, derive_peer_thread_id
 from harness_gateway.models import (
     InboundMessage,
     MessageEvent,
     MessageEventType,
     TextContent,
 )
+from langchain_core.messages import AIMessage, HumanMessage
 
 from octop.i18n.domains.stream import format_stream_error
+from octop.infra.agents.profile import parse_config_json
 from octop.infra.agents.providers.reasoning import reasoning_request_parameters
+from octop.infra.errors import OctopError
 from octop.infra.gateway.hitl.coordinator import (
+    HitlAnswerOutcome,
     HitlChannelCoordinator,
     HitlSlashOutcome,
     HitlStreamContext,
@@ -38,6 +44,7 @@ from octop.infra.gateway.process.harness_request import (
     build_content_from_message,
     build_harness_request,
 )
+from octop.infra.gateway.process.history_projection import TurnHistoryTracker, message_inputs
 from octop.infra.gateway.process.message_keys import (
     resolve_user_id_for_message,
     sanitize_im_metadata,
@@ -50,14 +57,16 @@ from octop.infra.gateway.process.stream_project import (
 )
 from octop.infra.gateway.process.usage_record import UsageTracker, record_turn_usage
 from octop.infra.gateway.slash.ctx import SlashCtx, build_slash_ctx
+from octop.infra.gateway.slash.parser import parse_slash
 from octop.infra.gateway.slash.runner import try_handle_slash
-from octop.infra.knowledge.default_open import merge_knowledge_base_ids
-from octop.infra.knowledge.hint import catalog_for_selected_bases
+from octop.infra.knowledge.default_open import stamp_turn_knowledge_config
+from octop.infra.trajectory.settings import agent_trajectory_enabled
 from octop.infra.users.preferences import (
     get_model_reasoning_from_json,
     get_preferred_model_from_json,
 )
 from octop.infra.utils.locale import resolve_user_locale
+from octop.infra.utils.ulid import new_ulid
 
 if TYPE_CHECKING:
     from octop.infra.agents.manager import AgentManager
@@ -70,6 +79,12 @@ if TYPE_CHECKING:
     from octop.infra.gateway.threads import ThreadRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _stream_error(exc: Exception, locale: str) -> tuple[str, str | None]:
+    if isinstance(exc, OctopError):
+        return exc.localized_message(locale), exc.code.value
+    return format_stream_error(exc, locale), None
 
 
 class _MessageEventSink(SlashSink):
@@ -102,8 +117,11 @@ class GlobalProcessor:
         provider_repo: Any | None = None,
         dispatcher: SlashDispatcher,
         usage_repo: Any | None = None,
+        thread_message_repo: Any | None = None,
         gateway: Any | None = None,
         hitl: HitlChannelCoordinator | None = None,
+        trajectory_service: Any | None = None,
+        history_archive: Any | None = None,
     ) -> None:
         self._agent_manager = agent_manager
         self._thread_registry = thread_registry
@@ -122,14 +140,328 @@ class GlobalProcessor:
         )
         self._dispatcher = dispatcher
         self._usage_repo = usage_repo
+        self._thread_message_repo = thread_message_repo
         self._gateway = gateway
         self._hitl = hitl or HitlChannelCoordinator()
+        self._trajectory_service = trajectory_service
+        self._history_archive = history_archive
+
+    async def _begin_history(
+        self, agent_id: str, thread_id: str, request: dict[str, Any], *, resume: bool = False
+    ) -> TurnHistoryTracker:
+        from octop.infra.history.recorder import RecordingTracker  # noqa: PLC0415
+
+        archive = self._history_archive
+        if archive is None:
+            return TurnHistoryTracker.from_request(request)
+        anchor = None
+        segments = await asyncio.to_thread(archive.store.segments, thread_id)
+        if archive.enabled and not segments and not resume:
+            # Pin the pre-switch checkpoint only for legacy threads lacking a
+            # usable projection. Do not load or rewrite their message bodies.
+            status = await asyncio.to_thread(archive.messages.projection_status, thread_id)
+            if status != "ready":
+                harness = self._agent_manager.get_agent(agent_id)
+                state = await harness.graph.aget_state({"configurable": {"thread_id": thread_id}})
+                if state is not None and getattr(state, "next", False):
+                    return TurnHistoryTracker.from_request(request)
+                checkpoint_config = getattr(state, "config", None)
+                if checkpoint_config and checkpoint_config.get("configurable", {}).get(
+                    "checkpoint_id"
+                ):
+                    anchor = {"checkpoint_config": checkpoint_config}
+                elif getattr(state, "values", {}).get("messages"):
+                    raise ValueError("Cannot pin the legacy history boundary")
+        turn = await asyncio.to_thread(
+            archive.begin, agent_id, thread_id, anchor=anchor, resume=resume
+        )
+        if turn is None:
+            return TurnHistoryTracker.from_request(request)
+        try:
+            tracker = await asyncio.to_thread(
+                RecordingTracker, archive, turn, list(request.get("messages") or [])
+            )
+            await tracker.flush()
+            return tracker
+        except BaseException:
+            try:
+                await asyncio.to_thread(
+                    archive.finish, turn["id"], "failed", error="initial_capture_failed"
+                )
+            except Exception:
+                logger.exception("failed to finalize history initialization thread=%s", thread_id)
+            raise
+
+    async def _finish_history(self, tracker: TurnHistoryTracker, *, completed: bool) -> None:
+        from octop.infra.history.recorder import RecordingTracker  # noqa: PLC0415
+
+        if isinstance(tracker, RecordingTracker):
+            if tracker.turn["format"] == "legacy" and completed and not tracker.paused:
+                return  # Finalize only after the legacy append commits.
+            await tracker.finish(completed=completed)
+
+    async def _complete_resumed_history(
+        self, thread_id: str, tracker: TurnHistoryTracker, *, completed: bool
+    ) -> None:
+        try:
+            if completed:
+                await self._record_turn_history(thread_id, tracker)
+        finally:
+            await self._finish_history(tracker, completed=completed)
 
     @property
     def hitl_coordinator(self) -> HitlChannelCoordinator:
         return self._hitl
 
+    def replace_thread_message_repo(self, repo: Any) -> None:
+        """Rebind projection writes after a control-plane restore."""
+        self._thread_message_repo = repo
+
+    def _agent_trajectory_enabled(self, agent_id: str, row: Any | None = None) -> bool:
+        if self._trajectory_service is None:
+            return False
+        agent_row = row if row is not None else self._agent_repo.get(agent_id)
+        if agent_row is None:
+            return False
+        return agent_trajectory_enabled(parse_config_json(getattr(agent_row, "config_json", None)))
+
+    def _observe_trajectory(
+        self,
+        *,
+        agent_id: str,
+        thread_id: str,
+        chunk: dict[str, Any],
+        enabled: bool | None = None,
+    ) -> None:
+        if enabled is False:
+            return
+        if enabled is None and not self._agent_trajectory_enabled(agent_id):
+            return
+        service = self._trajectory_service
+        if service is None:
+            return
+        try:
+            service.observe_chunk(agent_id, thread_id, chunk)
+        except Exception:
+            logger.exception(
+                "trajectory observe_chunk failed agent=%s thread=%s",
+                agent_id,
+                thread_id,
+            )
+
+    def _finish_trajectory(
+        self,
+        *,
+        thread_id: str,
+        usage: dict[str, Any] | None = None,
+        enabled: bool | None = None,
+    ) -> None:
+        if enabled is False:
+            return
+        service = self._trajectory_service
+        if service is None:
+            return
+        try:
+            service.finish_turn(thread_id, usage)
+        except Exception:
+            record_failure = getattr(service, "record_failure", None)
+            if callable(record_failure):
+                record_failure(thread_id)
+            logger.exception("trajectory finish_turn failed thread=%s", thread_id)
+
+    async def _observe_turn_start_context(
+        self,
+        *,
+        agent_id: str,
+        thread_id: str,
+        request: dict[str, Any],
+        meta: dict[str, Any],
+        phase: Literal["system", "context"] = "context",
+        trajectory_enabled: bool | None = None,
+    ) -> None:
+        """Emit SYSTEM / CONTEXT from harness injection sources of truth."""
+        if trajectory_enabled is False:
+            return
+        if trajectory_enabled is None and not self._agent_trajectory_enabled(agent_id):
+            return
+        service = self._trajectory_service
+        if service is None:
+            return
+        try:
+            from octop.infra.trajectory.turn_context import (  # noqa: PLC0415
+                build_turn_start_chunks,
+                filter_turn_skill_names,
+            )
+
+            include_system = phase == "system" and not bool(service.has_kind(thread_id, "system"))
+            system_prompt = self._trajectory_system_prompt(agent_id) if phase == "system" else None
+            workspace_files: list[str] = []
+            skills: list[str] | None = None
+            skills_filter_present = False
+            mcp_names: list[str] | None = None
+            if phase == "context":
+                workspace_files = await self._trajectory_workspace_files(agent_id)
+                skills_filter_present = "skills" in request or "skills" in meta
+                turn_skills: list[str] | None = None
+                if "skills" in request and isinstance(request.get("skills"), list):
+                    turn_skills = [str(x) for x in request["skills"]]
+                elif "skills" in meta and isinstance(meta.get("skills"), list):
+                    turn_skills = [str(x) for x in meta["skills"]]
+                enabled = await self._trajectory_enabled_skill_names(agent_id)
+                if enabled is not None:
+                    skills = filter_turn_skill_names(
+                        enabled,
+                        turn_skills=turn_skills,
+                        skills_filter_present=skills_filter_present,
+                    )
+                mcp_names = _mcp_server_names(request.get("mcp_servers"))
+            for chunk in build_turn_start_chunks(
+                include_system=include_system,
+                system_prompt=system_prompt,
+                workspace_files=workspace_files,
+                skills=skills,
+                mcp_servers=mcp_names,
+                skills_filter_present=skills_filter_present,
+            ):
+                self._observe_trajectory(
+                    agent_id=agent_id,
+                    thread_id=thread_id,
+                    chunk=chunk,
+                    enabled=True,
+                )
+        except Exception:
+            logger.exception(
+                "trajectory turn-start context failed agent=%s thread=%s",
+                agent_id,
+                thread_id,
+            )
+
+    def _trajectory_system_prompt(self, agent_id: str) -> str | None:
+        """Live harness config prompt — same string the graph was compiled with."""
+        try:
+            agent = self._agent_manager.get_agent(agent_id)
+            prompt = getattr(getattr(agent, "_config", None), "system_prompt", None)
+            if isinstance(prompt, str) and prompt.strip():
+                return prompt
+        except Exception:
+            logger.debug(
+                "trajectory live system_prompt unavailable agent=%s",
+                agent_id,
+                exc_info=True,
+            )
+        row = self._agent_repo.get(agent_id)
+        if row is not None and isinstance(row.system_prompt, str) and row.system_prompt.strip():
+            return row.system_prompt
+        return None
+
+    async def _trajectory_enabled_skill_names(self, agent_id: str) -> list[dict[str, str]] | None:
+        """Enabled skills from harness catalog (SoT for prompt skill section)."""
+        try:
+            agent = self._agent_manager.get_agent(agent_id)
+            summaries = await agent.list_skill_summaries()
+        except Exception:
+            logger.debug(
+                "trajectory skill catalog unavailable agent=%s",
+                agent_id,
+                exc_info=True,
+            )
+            return None
+        rows: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for row in summaries:
+            if not isinstance(row, dict) or not row.get("enabled", True):
+                continue
+            name = str(row.get("name") or row.get("slug") or "").strip()
+            slug = str(row.get("slug") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            item = {"name": name}
+            if slug:
+                item["slug"] = slug
+            rows.append(item)
+        return rows
+
+    async def _trajectory_workspace_files(self, agent_id: str) -> list[str]:
+        """Return existing harness memory paths without duplicating their contents."""
+        from octop.infra.trajectory.turn_context import memory_file_order  # noqa: PLC0415
+
+        workspace = harness_workspace_for_agent(self._agent_manager, agent_id)
+        if workspace is None:
+            return []
+        out: list[str] = []
+        for name in memory_file_order():
+            try:
+                exists = await workspace.aexists(name)
+            except Exception:
+                logger.debug(
+                    "trajectory workspace exists failed agent=%s path=%s",
+                    agent_id,
+                    name,
+                    exc_info=True,
+                )
+                continue
+            if not exists:
+                continue
+            out.append(name)
+        return out
+
     # -- TeamProcessor (harness inbox async peer collaboration) ----------------
+
+    async def prepare_peer_session(self, call: PeerCall) -> PeerSession | None:
+        """Map an ``ask_agent`` call onto the callee's threads row (no inbound gateway)."""
+        thread_id = (
+            derive_peer_thread_id(call.source_thread_id, call.to_agent_id)
+            if call.source_thread_id
+            else None
+        )
+        session_key = None
+        if call.source_session_key:
+            session_key = self._thread_registry.peer_session_key(
+                call.source_session_key, call.to_agent_id
+            )
+        uid = _octop_user_id(call.user_id)
+        if thread_id and session_key and uid is not None:
+            parts = session_key.split(":", 3)
+            channel_type = parts[1] if len(parts) == 4 else "dashboard"
+            self._thread_registry.ensure_thread(
+                thread_id=thread_id,
+                agent_id=call.to_agent_id,
+                user_id=uid,
+                channel_type=channel_type,
+                session_key=session_key,
+            )
+        return PeerSession(thread_id=thread_id, session_key=session_key)
+
+    async def record_peer_turn(
+        self,
+        call: PeerCall,
+        thread_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        """Touch the callee thread and project history after a peer ``call``."""
+        if not thread_id:
+            return
+        self._touch_thread_after_turn(thread_id, call.message)
+        if self._thread_message_repo is None:
+            return
+        messages = result.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return
+        visible = _peer_turn_messages(messages)
+        if not visible:
+            return
+        try:
+            self._thread_message_repo.append_if_ready(
+                thread_id,
+                message_inputs(visible, dedupe_missing_ids=True),
+            )
+        except Exception:
+            logger.warning(
+                "failed to append peer history projection for thread=%s",
+                thread_id,
+                exc_info=True,
+            )
 
     def compose_followup(
         self,
@@ -359,6 +691,8 @@ class GlobalProcessor:
                 locale=locale,
                 usage_tracker=usage_tracker,
                 outcome=slash_outcome,
+                history_factory=self._begin_history,
+                history_finalize=self._complete_resumed_history,
             ):
                 yield ev
             if slash_outcome.completed_turn:
@@ -383,6 +717,55 @@ class GlobalProcessor:
                         )
             yield MessageEvent.completed()
             return
+
+        # An open ``ask_user_question`` pause turns the user's next message into
+        # the answer for that paused turn instead of starting a new one.
+        if cmd is None and msg.text.strip():
+            ask_record = self._hitl.resolve_ask_pending(
+                session_key,
+                agent_id=agent_id,
+                user_id=user_id,
+            )
+            if ask_record is not None:
+                usage_tracker = UsageTracker()
+                history_tracker = await self._begin_history(
+                    agent_id, ask_record.thread_id, {}, resume=True
+                )
+                answer_outcome = HitlAnswerOutcome()
+                try:
+                    async for ev in self._hitl.iter_answer_resolution(
+                        ask_record,
+                        msg.text,
+                        agent_manager=self._agent_manager,
+                        locale=locale,
+                        usage_tracker=usage_tracker,
+                        history_tracker=history_tracker,
+                        outcome=answer_outcome,
+                    ):
+                        yield ev
+                finally:
+                    from octop.infra.history.recorder import RecordingTracker  # noqa: PLC0415
+
+                    if (
+                        isinstance(history_tracker, RecordingTracker)
+                        and answer_outcome.awaiting_more
+                    ):
+                        history_tracker.paused = True
+                    await self._finish_history(
+                        history_tracker, completed=answer_outcome.completed_turn
+                    )
+                if answer_outcome.completed_turn:
+                    self._touch_thread_after_turn(ask_record.thread_id, msg.text)
+                    if usage_tracker.usage:
+                        self._record_turn_usage(
+                            agent_id=agent_id,
+                            user_id=user_id,
+                            thread_id=ask_record.thread_id,
+                            usage=usage_tracker.usage,
+                        )
+                    await self._record_turn_history(ask_record.thread_id, history_tracker)
+                yield MessageEvent.completed()
+                return
 
         if cmd is not None:
             sink = _MessageEventSink()
@@ -466,6 +849,7 @@ class GlobalProcessor:
             is_admin=False,
             explicit_ids=None,
             locale=locale,
+            agent_id=agent_id,
         )
         if mcp_servers:
             request["mcp_servers"] = mcp_servers
@@ -474,6 +858,7 @@ class GlobalProcessor:
         stream_ok = False
         hitl_paused = False
         usage_tracker = UsageTracker()
+        history_tracker = await self._begin_history(agent_id, thread_id, request)
         projection_state = StreamProjectionState()
         try:
             async for ev in project_stream(
@@ -482,6 +867,7 @@ class GlobalProcessor:
                 request,
                 media_backend=media_backend,
                 usage_tracker=usage_tracker,
+                history_tracker=history_tracker,
                 locale=locale,
                 projection_state=projection_state,
                 hitl_coordinator=self._hitl,
@@ -498,7 +884,10 @@ class GlobalProcessor:
             hitl_paused = projection_state.hitl_paused
         except Exception as exc:
             await self._record_stream_error(user_id=user_id, agent_id=agent_id, exc=exc)
-            yield MessageEvent.error_event(format_stream_error(exc, locale))
+            message, error_code = _stream_error(exc, locale)
+            if error_code:
+                message = f"[{error_code}] {message}"
+            yield MessageEvent.error_event(message)
         else:
             if stream_ok and not hitl_paused:
                 self._touch_thread_after_turn(thread_id, msg.text)
@@ -508,6 +897,9 @@ class GlobalProcessor:
                     thread_id=thread_id,
                     usage=usage_tracker.usage,
                 )
+                await self._record_turn_history(thread_id, history_tracker)
+        finally:
+            await self._finish_history(history_tracker, completed=stream_ok and not hitl_paused)
         yield MessageEvent.completed()
 
     # -- Raw harness-chunk stream (Dashboard WS, etc.) -------------------------
@@ -534,6 +926,7 @@ class GlobalProcessor:
             return
 
         agent_row = self._agent_repo.get(agent_id)
+        traj_on = self._agent_trajectory_enabled(agent_id, agent_row)
         user_id = resolve_user_id_for_message(
             msg,
             agent_owner_id=agent_row.user_id if agent_row is not None else None,
@@ -555,6 +948,23 @@ class GlobalProcessor:
             ),
         )
         if handled:
+            thread_id = meta.get("thread_id")
+            if not isinstance(thread_id, str) or not thread_id.strip():
+                thread_id = await self._thread_registry.get_or_create_by_key(
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    channel_type=channel_type,
+                    channel_channel_id=msg.channel_id or None,
+                    channel_metadata=im_meta,
+                )
+            await self._append_slash_checkpoint(
+                agent_id=agent_id,
+                thread_id=thread_id,
+                command=msg.text,
+                response_lines=slash_lines,
+            )
+            self._touch_thread_after_turn(thread_id, msg.text)
             for line in slash_lines:
                 yield {"type": "token", "content": f"{line}\n"}
             for action in slash_actions:
@@ -562,6 +972,12 @@ class GlobalProcessor:
             yield {"type": "done"}
             return
 
+        locale = resolve_user_locale(
+            user_repo=self._user_repo,
+            user_id=user_id,
+            channel_type=channel_type,
+            metadata=meta,
+        )
         thread_id = meta.get("thread_id")
         if not isinstance(thread_id, str) or not thread_id.strip():
             thread_id = await self._thread_registry.get_or_create_by_key(
@@ -581,20 +997,47 @@ class GlobalProcessor:
             thread_id=thread_id,
             meta=meta,
         )
+        history_tracker = await self._begin_history(agent_id, thread_id, request)
+        await self._observe_turn_start_context(
+            agent_id=agent_id,
+            thread_id=thread_id,
+            request=request,
+            meta=meta,
+            phase="system",
+            trajectory_enabled=traj_on,
+        )
+        self._observe_trajectory(
+            agent_id=agent_id,
+            thread_id=thread_id,
+            chunk={"type": "user", "content": msg.text or "", "source": channel_type},
+            enabled=traj_on,
+        )
+        await self._observe_turn_start_context(
+            agent_id=agent_id,
+            thread_id=thread_id,
+            request=request,
+            meta=meta,
+            phase="context",
+            trajectory_enabled=traj_on,
+        )
 
         stream_ok = False
         harness_workspace = harness_workspace_for_agent(self._agent_manager, agent_id)
         usage_tracker = UsageTracker()
-        locale = resolve_user_locale(
-            user_repo=self._user_repo,
-            user_id=user_id,
-            channel_type=channel_type,
-            metadata=meta,
-        )
 
         try:
             async for chunk in self._agent_manager.stream(agent_id, request):
                 usage_tracker.observe(chunk)
+                history_tracker.observe(chunk)
+                from octop.infra.history.recorder import flush_tracker  # noqa: PLC0415
+
+                await flush_tracker(history_tracker)
+                self._observe_trajectory(
+                    agent_id=agent_id,
+                    thread_id=thread_id,
+                    chunk=chunk,
+                    enabled=traj_on,
+                )
                 if chunk.get("type") == "hitl_required":
                     request_payload = chunk.get("request")
                     if isinstance(request_payload, dict):
@@ -639,7 +1082,14 @@ class GlobalProcessor:
             stream_ok = True
         except Exception as exc:
             await self._record_stream_error(user_id=user_id, agent_id=agent_id, exc=exc)
-            yield {"type": "error", "message": format_stream_error(exc, locale)}
+            message, error_code = _stream_error(exc, locale)
+            payload = {"type": "error", "message": message}
+            if error_code:
+                payload["error_code"] = error_code
+            yield payload
+        finally:
+            self._finish_trajectory(thread_id=thread_id, usage=usage_tracker.usage, enabled=traj_on)
+            await self._finish_history(history_tracker, completed=stream_ok)
         if stream_ok:
             self._touch_thread_after_turn(thread_id, msg.text)
             self._record_turn_usage(
@@ -648,7 +1098,53 @@ class GlobalProcessor:
                 thread_id=thread_id,
                 usage=usage_tracker.usage,
             )
+            await self._record_turn_history(thread_id, history_tracker)
         yield {"type": "done"}
+
+    async def iter_hitl_resume_chunks(
+        self,
+        *,
+        agent_id: str,
+        thread_id: str,
+        user_id: int,
+        decisions: list[dict[str, Any]],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Resume a dashboard HITL turn with the normal history bookkeeping."""
+        usage_tracker = UsageTracker()
+        history_tracker = await self._begin_history(agent_id, thread_id, {}, resume=True)
+        completed = False
+        traj_on = self._agent_trajectory_enabled(agent_id)
+        try:
+            async for chunk in self._agent_manager.resume_hitl(
+                agent_id,
+                thread_id,
+                decisions,
+            ):
+                usage_tracker.observe(chunk)
+                history_tracker.observe(chunk)
+                from octop.infra.history.recorder import flush_tracker  # noqa: PLC0415
+
+                await flush_tracker(history_tracker)
+                self._observe_trajectory(
+                    agent_id=agent_id,
+                    thread_id=thread_id,
+                    chunk=chunk,
+                    enabled=traj_on,
+                )
+                yield chunk
+            completed = True
+        finally:
+            self._finish_trajectory(thread_id=thread_id, usage=usage_tracker.usage, enabled=traj_on)
+            await self._finish_history(history_tracker, completed=completed)
+            if completed:
+                self._touch_thread_after_turn(thread_id, None)
+                self._record_turn_usage(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    usage=usage_tracker.usage,
+                )
+                await self._record_turn_history(thread_id, history_tracker)
 
     async def _build_dashboard_request(
         self,
@@ -756,30 +1252,13 @@ class GlobalProcessor:
             if isinstance(meta.get("knowledge_base_ids"), list)
             else None,
             locale=locale,
+            agent_id=agent_id,
         )
 
         if mcp_servers:
             request["mcp_servers"] = mcp_servers
         if "skills" in meta:
             request["skills"] = meta["skills"]
-        target_raw = meta.get("target_agent_ids")
-        if isinstance(target_raw, list) and target_raw:
-            is_admin = bool(meta.get("user_is_admin"))
-            filtered: list[str] = []
-            for raw_id in target_raw:
-                aid = str(raw_id).strip()
-                if not aid or aid == agent_id:
-                    continue
-                row = self._agent_repo.get(aid)
-                if row is None:
-                    continue
-                if not is_admin and row.user_id is not None and row.user_id != user_id:
-                    continue
-                filtered.append(aid)
-            if filtered:
-                configurable = dict(request.get("configurable") or {})
-                configurable["target_agent_ids"] = filtered
-                request["configurable"] = configurable
         return request
 
     def _attach_turn_knowledge_config(
@@ -790,6 +1269,7 @@ class GlobalProcessor:
         is_admin: bool,
         explicit_ids: list[str] | None,
         locale: str,
+        agent_id: str | None = None,
     ) -> None:
         """Expose selected knowledge-base ids for the search_knowledge tool."""
         if self._knowledge_services is None:
@@ -799,13 +1279,16 @@ class GlobalProcessor:
             if is_admin
             else self._knowledge_services.knowledge_repo.list_visible(user_id)
         )
-        selected_ids = merge_knowledge_base_ids(bases, explicit_ids, owner_user_id=user_id)
-        configurable = dict(request.get("configurable") or {})
-        configurable["knowledge_base_ids"] = selected_ids
-        configurable["knowledge_base_catalog"] = catalog_for_selected_bases(bases, selected_ids)
-        configurable["user_is_admin"] = is_admin
-        configurable["locale"] = locale
-        request["configurable"] = configurable
+        extra_ids = self._agent_manager.default_knowledge_base_ids(agent_id) if agent_id else None
+        stamp_turn_knowledge_config(
+            request,
+            visible_bases=bases,
+            explicit_ids=explicit_ids,
+            owner_user_id=user_id,
+            extra_ids=extra_ids,
+            is_admin=is_admin,
+            locale=locale,
+        )
 
     async def _resolve_turn_mcp_servers(
         self,
@@ -825,7 +1308,10 @@ class GlobalProcessor:
         from octop.infra.errors import ErrorCode, OctopError  # noqa: PLC0415
 
         merged = self._agent_manager.merge_turn_mcp_servers(
-            user_id, explicit, apply_defaults=apply_defaults
+            user_id,
+            explicit,
+            apply_defaults=apply_defaults,
+            extra_defaults=self._agent_manager.default_mcp_servers(agent_id),
         )
         if not merged:
             return None
@@ -883,3 +1369,113 @@ class GlobalProcessor:
             thread_id=thread_id,
             usage=usage,
         )
+
+    async def _record_turn_history(
+        self,
+        thread_id: str,
+        tracker: TurnHistoryTracker,
+    ) -> None:
+        from octop.infra.history.recorder import RecordingTracker  # noqa: PLC0415
+
+        if isinstance(tracker, RecordingTracker):
+            if tracker.turn["format"] == "legacy":
+                await asyncio.to_thread(
+                    tracker.archive.messages.append_legacy_interval, thread_id, tracker.inputs
+                )
+                await tracker.finish(completed=True)
+            return
+        if self._thread_message_repo is None:
+            return
+        try:
+            self._thread_message_repo.append_if_ready(thread_id, tracker.inputs)
+        except Exception:
+            # History projection is a read optimization and must never turn a
+            # successful model response into a failed chat turn.
+            logger.warning(
+                "failed to append thread history projection for thread=%s",
+                thread_id,
+                exc_info=True,
+            )
+
+    async def _append_slash_checkpoint(
+        self,
+        *,
+        agent_id: str,
+        thread_id: str,
+        command: str,
+        response_lines: list[str],
+    ) -> None:
+        """Persist slash input/output via harness checkpoint, same as cron text."""
+        turn_id = new_ulid()
+        response = "\n".join(response_lines).strip()
+        canonical: list[HumanMessage | AIMessage] = [
+            HumanMessage(content=command, id=f"slash:{turn_id}:human"),
+        ]
+        if response:
+            canonical.append(AIMessage(content=response, id=f"slash:{turn_id}:assistant"))
+        try:
+            harness = self._agent_manager.get_agent(agent_id)
+            appended = await harness.aappend_messages(thread_id, canonical)
+        except Exception:
+            logger.warning(
+                "failed to append slash checkpoint for thread=%s",
+                thread_id,
+                exc_info=True,
+            )
+            return
+        if self._thread_message_repo is None:
+            return
+        try:
+            self._thread_message_repo.append_if_ready(
+                thread_id,
+                message_inputs(appended, dedupe_missing_ids=True),
+            )
+        except Exception:
+            logger.warning(
+                "failed to append slash history projection for thread=%s",
+                thread_id,
+                exc_info=True,
+            )
+
+
+def _octop_user_id(user_id: str | int) -> int | None:
+    if isinstance(user_id, int):
+        return user_id if user_id > 0 else None
+    if isinstance(user_id, str) and user_id.isdigit():
+        uid = int(user_id)
+        return uid if uid > 0 else None
+    return None
+
+
+def _peer_turn_messages(messages: list[Any]) -> list[Any]:
+    """This turn's user prompt and final assistant reply (skip prior thread history)."""
+    trigger: Any | None = None
+    final_ai: Any | None = None
+    for msg in messages:
+        role = ""
+        if isinstance(msg, dict):
+            role = str(msg.get("role") or msg.get("type") or "").lower()
+            tool_calls = msg.get("tool_calls")
+        else:
+            role = str(getattr(msg, "type", None) or getattr(msg, "role", "") or "").lower()
+            tool_calls = getattr(msg, "tool_calls", None)
+        if role in ("human", "user"):
+            trigger = msg
+        if role in ("ai", "assistant") and not tool_calls:
+            final_ai = msg
+    out: list[Any] = []
+    if trigger is not None:
+        out.append(trigger)
+    if final_ai is not None:
+        out.append(final_ai)
+    return out
+
+
+def _mcp_server_names(raw: Any) -> list[str] | None:
+    if isinstance(raw, list):
+        names = [str(item).strip() for item in raw if str(item).strip()]
+        return names or None
+    if isinstance(raw, dict):
+        names = [str(key).strip() for key in raw if str(key).strip()]
+        return names or None
+    return None

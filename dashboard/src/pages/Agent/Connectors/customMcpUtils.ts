@@ -18,8 +18,13 @@ export interface ServerCardState {
   envText: string;
   enabled: boolean;
   defaultOpen: boolean;
+  shared: boolean;
   collapsed: boolean;
+  oauthConfigured: boolean;
+  oauthExpiresAt?: number;
 }
+
+export const PROBE_ON_SAVE_KEY = "octop.customMcp.probeOnSave";
 
 export const EXAMPLE_JSON = `{
   "deepwiki": {
@@ -121,7 +126,10 @@ export function serversToCards(servers: CustomMcpServers): ServerCardState[] {
     envText: envToText(spec.env),
     enabled: spec.enabled !== false,
     defaultOpen: spec.default_open === true,
+    shared: spec.shared === true,
     collapsed: true,
+    oauthConfigured: spec.oauth?.configured === true,
+    oauthExpiresAt: spec.oauth?.expires_at,
   }));
 }
 
@@ -145,6 +153,9 @@ export function cardsToServers(cards: ServerCardState[]): CustomMcpServers {
     }
     if (card.defaultOpen) {
       spec.default_open = true;
+    }
+    if (card.shared) {
+      spec.shared = true;
     }
     if (card.transport === "streamable_http") {
       spec.url = card.url.trim();
@@ -171,6 +182,54 @@ export function cardsToServers(cards: ServerCardState[]): CustomMcpServers {
   return servers;
 }
 
+/** Whether any server uses HTTP transport (probe / OAuth apply to these only). */
+export function hasHttpProbeTargets(
+  cards: ServerCardState[] | CustomMcpServers,
+): boolean {
+  if (Array.isArray(cards)) {
+    return cards.some((card) => card.transport === "streamable_http");
+  }
+  return Object.values(cards).some(
+    (spec) =>
+      spec &&
+      typeof spec === "object" &&
+      (spec as CustomMcpServerSpec).transport !== "stdio",
+  );
+}
+
+export function mergeCustomMcpCards(
+  servers: CustomMcpServers,
+  prevCards: ServerCardState[],
+): ServerCardState[] {
+  return serversToCards(servers).map((card) => {
+    const prev = prevCards.find((c) => c.name.trim() === card.name.trim());
+    if (!prev) return card;
+    return {
+      ...card,
+      key: prev.key,
+      collapsed: prev.collapsed,
+    };
+  });
+}
+
+export function oauthHintsFromServers(
+  servers: CustomMcpServers,
+  cards: ServerCardState[],
+): Record<string, boolean> {
+  const hints: Record<string, boolean> = {};
+  for (const card of cards) {
+    const spec = servers[card.name.trim()];
+    if (
+      card.transport === "streamable_http" &&
+      spec?.oauth?.required &&
+      spec.oauth?.configured !== true
+    ) {
+      hints[card.key] = true;
+    }
+  }
+  return hints;
+}
+
 export function newCard(
   transport: CustomMcpTransport,
   index: number,
@@ -189,7 +248,9 @@ export function newCard(
     envText: "",
     enabled: true,
     defaultOpen: false,
+    shared: false,
     collapsed: false,
+    oauthConfigured: false,
   };
 }
 
